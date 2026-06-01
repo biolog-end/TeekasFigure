@@ -1,0 +1,27 @@
+[package]
+name = "gpu-image-approximator"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated image approximation using stochastic hill climbing with textured shapes"
+
+[dependencies]
+wgpu = "23.0.1"
+winit = "0.30.8"
+egui = "0.30.0"
+egui-wgpu = "0.30.0"
+egui-winit = "0.30.0"
+image = "0.25.5"
+toml = "0.8.19"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_derive = "1.0.217"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+rand = { version = "0.8.5", features = ["small_rng"] }
+thiserror = "2.0.11"
+chrono = "0.4.39"
+pollster = "0.4.0"
+env_logger = "0.11.6"
+log = "0.4.22"
+
+[dev-dependencies]
+proptest = "1.6.0"
+tempfile = "3.14.0"
