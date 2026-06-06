@@ -95,6 +95,9 @@ pub struct App {
     pub video_pipeline: Option<crate::algorithm::VideoPipeline>,
     /// Video decoder process (None for image mode)
     pub video_decoder: Option<crate::io::video::VideoProcessor>,
+    /// Index of the next output frame file (used for video PNG names so we
+    /// can interleave keyframes and interpolated frames in a single sequence).
+    output_frame_index: u32,
 }
 
 impl App {
@@ -155,6 +158,7 @@ impl App {
             last_frame: now,
             video_pipeline: if is_video { Some(crate::algorithm::VideoPipeline::new()) } else { None },
             video_decoder: None,
+            output_frame_index: 0,
         }
     }
 
@@ -286,17 +290,46 @@ impl App {
 
     /// Handle video frame completion: save current frame, advance to next.
     fn handle_video_frame_complete(&mut self) {
-        // Save current frame as PNG
+        // Generation just finished a keyframe. Before we save it, render the
+        // intermediate (interpolated) frames between the previous keyframe
+        // and the current one — this fills in motion blur-like smoothness
+        // without running evolution on every output frame.
+        let interp = self.settings.interpolation_steps;
+        if interp > 0 && self.overlay.frame_number > 0 {
+            if let Some(ref pipeline) = self.video_pipeline {
+                for step in 1..=interp {
+                    let t = step as f32 / (interp as f32 + 1.0);
+                    pipeline.render_interpolated_frame(&self.gpu, t);
+                    let inter_filename = format!("frame_{:05}.png", self.output_frame_index);
+                    self.output_frame_index += 1;
+                    if let Err(e) = io::output::save_canvas_png(
+                        &self.gpu,
+                        &self.output_folder,
+                        &inter_filename,
+                    ) {
+                        log::error!("Failed to save interpolated frame {}: {}", inter_filename, e);
+                    } else {
+                        log::debug!("Saved interpolated frame: {}", inter_filename);
+                    }
+                }
+                // Restore the canvas to the actual current keyframe state so
+                // the next save captures the evolved result, not the last lerp.
+                pipeline.rebuild_canvas(&self.gpu);
+            }
+        }
+
+        // Save current keyframe as PNG (next slot in the global sequence).
         let frame_num = self.overlay.frame_number;
         log::info!(
             "Frame {} complete with {} shapes in pipeline",
             frame_num,
             self.video_pipeline.as_ref().map(|p| p.shapes.len()).unwrap_or(0)
         );
-        let filename = format!("frame_{:05}.png", frame_num);
+        let filename = format!("frame_{:05}.png", self.output_frame_index);
+        self.output_frame_index += 1;
         match io::output::save_canvas_png(&self.gpu, &self.output_folder, &filename) {
             Ok(path) => {
-                log::info!("Saved video frame: {}", path.display());
+                log::info!("Saved video keyframe: {}", path.display());
             }
             Err(e) => {
                 log::error!("Failed to save frame {}: {}", frame_num, e);
@@ -336,27 +369,45 @@ impl App {
 
                 // Adapt existing shapes to new frame
                 if let Some(ref mut pipeline) = self.video_pipeline {
+                    let before = pipeline.shapes.len();
                     let dead = pipeline.adapt_to_new_frame(&self.gpu, &mut self.generator, &self.settings);
-                    log::info!("Frame {}: {} shapes died, {} remain", frame_num + 1, dead, pipeline.shapes.len());
+                    log::info!(
+                        "Frame {}: adapted {} shapes, {} died (scene change), {} remain",
+                        frame_num + 1, before, dead, pipeline.shapes.len()
+                    );
 
                     // Rebuild canvas from adapted shapes
                     pipeline.rebuild_canvas(&self.gpu);
                 }
 
-                // Reset climber for new shapes to fill gaps
+                // The pipeline already produced a full-population canvas for
+                // this frame: surviving shapes adapted in place (GEOMETRY only —
+                // they keep their color unless `video_recolor` is on) and every
+                // dead shape was reborn via a full evolution. There is nothing
+                // for the generic hill-climber refill to do here.
+                //
+                // Running the refill (as before) repainted the canvas with
+                // brand-new shapes coloured from the CURRENT frame every single
+                // frame — which looks exactly like the whole image "re-coloring"
+                // itself and completely defeats `video_recolor=false`. So we
+                // mark the climber as already full: its next `step` returns
+                // Completed, which simply advances us to the next video frame
+                // (no new shapes, no repaint).
                 self.climber = HillClimber::new();
-                // Pass surviving shape count so climber only generates missing shapes
+                self.climber.placed_shapes = self.settings.max_shapes;
                 if let Some(ref pipeline) = self.video_pipeline {
-                    self.climber.placed_shapes = pipeline.shapes.len() as u32;
                     log::info!(
-                        "Frame {}: {} shapes survived, will generate up to {} new ones",
+                        "Frame {}: {} shapes after adaptation + rebirth (population frozen, no refill repaint)",
                         self.overlay.frame_number + 1,
                         pipeline.shapes.len(),
-                        self.settings.max_shapes.saturating_sub(pipeline.shapes.len() as u32)
                     );
                 }
                 self.overlay.frame_number += 1;
-                self.overlay.placed_shapes = self.climber.placed_shapes;
+                self.overlay.placed_shapes = self
+                    .video_pipeline
+                    .as_ref()
+                    .map(|p| p.shapes.len() as u32)
+                    .unwrap_or(self.climber.placed_shapes);
 
                 self.window.set_title(&format!(
                     "GPU Image Approximator - Frame {} - Running",
@@ -381,13 +432,17 @@ impl App {
                 } else {
                     30.0
                 };
+                // If interpolation is enabled, the output sequence has
+                // (interpolation_steps + 1) frames per keyframe, so the
+                // playback fps must scale up to keep wall-clock duration.
+                let output_fps = fps * (self.settings.interpolation_steps as f64 + 1.0);
 
                 // Use FFmpeg to encode saved frames to MP4
                 let frames_pattern = self.output_folder.join("frame_%05d.png");
                 let encode_result = std::process::Command::new("ffmpeg")
                     .args([
                         "-y",
-                        "-framerate", &format!("{}", fps),
+                        "-framerate", &format!("{}", output_fps),
                         "-i", frames_pattern.to_str().unwrap_or(""),
                         "-c:v", "libx264",
                         "-pix_fmt", "yuv420p",
@@ -396,23 +451,51 @@ impl App {
                     ])
                     .output();
 
-                match encode_result {
-                    Ok(output) if output.status.success() => {
-                        log::info!("Video encoded: {}", output_mp4.display());
-                        self.overlay.add_notification(
-                            format!("Video saved: {}", output_mp4.display()),
-                            10.0,
-                            false,
-                        );
-                    }
-                    _ => {
-                        log::error!("FFmpeg encoding failed");
-                        self.overlay.add_notification(
-                            "FFmpeg encoding failed".to_string(),
-                            5.0,
-                            true,
-                        );
-                    }
+                // Only report success once the MP4 actually exists on disk AND
+                // is non-empty — i.e. the file is fully written and playable,
+                // not still being produced. FFmpeg returning success but
+                // leaving a 0-byte/missing file (e.g. no frames, disk error)
+                // must be treated as a failure.
+                let encoded_ok = matches!(&encode_result, Ok(o) if o.status.success());
+                let file_ready = std::fs::metadata(&output_mp4)
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+
+                if encoded_ok && file_ready {
+                    let size_bytes = std::fs::metadata(&output_mp4).map(|m| m.len()).unwrap_or(0);
+                    let total_frames = self.output_frame_index;
+                    // Explicit, unambiguous completion log: the file exists and
+                    // is ready to play at this point.
+                    log::info!(
+                        "VIDEO READY: '{}' written ({} frames, {} bytes). The file is complete and playable.",
+                        output_mp4.display(), total_frames, size_bytes
+                    );
+                    println!(
+                        "VIDEO READY: {} ({} frames, {} bytes) — file is complete and playable.",
+                        output_mp4.display(), total_frames, size_bytes
+                    );
+                    self.window.set_title("GPU Image Approximator - Video Ready (file saved)");
+                    self.overlay.add_notification(
+                        format!("Video ready: {}", output_mp4.display()),
+                        15.0,
+                        false,
+                    );
+                } else {
+                    let detail = match &encode_result {
+                        Ok(o) if !o.status.success() => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            format!("ffmpeg exited with {}: {}", o.status, stderr.trim())
+                        }
+                        Ok(_) => "ffmpeg succeeded but output file is missing or empty".to_string(),
+                        Err(e) => format!("failed to launch ffmpeg: {}", e),
+                    };
+                    log::error!("FFmpeg encoding failed: {}", detail);
+                    self.window.set_title("GPU Image Approximator - Video encoding FAILED");
+                    self.overlay.add_notification(
+                        format!("Video encoding failed: {}", detail),
+                        15.0,
+                        true,
+                    );
                 }
             }
         } else {
@@ -429,7 +512,11 @@ impl App {
         self.overlay.fps = fps;
 
         // Update overlay state from algorithm
-        self.overlay.placed_shapes = self.climber.placed_shapes;
+        self.overlay.placed_shapes = self
+            .video_pipeline
+            .as_ref()
+            .map(|p| p.shapes.len() as u32)
+            .unwrap_or(self.climber.placed_shapes);
         self.overlay.current_mse = self.climber.current_mse;
 
         // Get surface texture

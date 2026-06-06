@@ -271,6 +271,16 @@ fn run() -> Result<(), AppError> {
 
     // If video mode, set up the video decoder
     if is_video {
+        // Clear any leftover frame_NNNNN.png files from a PREVIOUS video run.
+        // Frames are encoded via the frame_%05d.png pattern, so stale higher-
+        // numbered frames from a longer previous run would otherwise be appended
+        // to the new (shorter) video. Clearing guarantees the new video contains
+        // only this run's frames.
+        let removed = io::output::clean_frame_sequence(&output_folder);
+        if removed > 0 {
+            log::info!("Removed {} leftover frame_*.png file(s) from a previous run", removed);
+        }
+
         let output_video = output_folder.join(
             format!("{}_result.mp4",
                 media_path.file_stem().and_then(|s| s.to_str()).unwrap_or("video"))

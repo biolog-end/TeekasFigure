@@ -39,22 +39,29 @@ struct VideoInfo {
 
 impl VideoProcessor {
     /// Create a new VideoProcessor by probing the input video and spawning
-    /// FFmpeg decode and encode processes.
+    /// the FFmpeg decode process.
     ///
     /// - `input`: path to the source video file
-    /// - `output`: path to the output video file
+    /// - `output`: path to the output video file (used only if the pipe-based
+    ///   encoder is later started via [`encode_frame`])
     /// - `target_fps`: resample video to this framerate before processing
+    ///
+    /// NOTE: the encoder process is **not** spawned here. The current app
+    /// assembles the final MP4 from saved `frame_*.png` files via a separate
+    /// FFmpeg invocation. Spawning an idle encoder that targets the same
+    /// `output` path would keep that file open and, on shutdown, finalize an
+    /// empty stream over the freshly written MP4 — corrupting it. The encoder
+    /// is therefore created lazily only when [`encode_frame`] is actually used.
     pub fn new(input: &Path, output: &Path, target_fps: u32) -> Result<Self, AppError> {
         let info = Self::probe_video(input)?;
 
         let decoder = Self::spawn_decoder(input, target_fps)?;
         // Use target_fps for the output as well
         let output_fps = target_fps as f64;
-        let encoder = Self::spawn_encoder(output, info.width, info.height, output_fps)?;
 
         Ok(Self {
             decoder,
-            encoder: Some(encoder),
+            encoder: None,
             input_path: input.to_path_buf(),
             output_path: output.to_path_buf(),
             width: info.width,
@@ -106,6 +113,18 @@ impl VideoProcessor {
                 expected_size,
                 data.len()
             )));
+        }
+
+        if self.encoder.is_none() {
+            // Lazily spawn the encoder the first time a frame is actually
+            // submitted, so an idle encoder never holds the output file open.
+            let encoder = Self::spawn_encoder(
+                &self.output_path,
+                self.width,
+                self.height,
+                self.fps,
+            )?;
+            self.encoder = Some(encoder);
         }
 
         if let Some(ref mut encoder) = self.encoder {
@@ -350,5 +369,24 @@ impl VideoProcessor {
                     e
                 ))
             })
+    }
+}
+
+impl Drop for VideoProcessor {
+    /// Ensure the spawned FFmpeg child processes are terminated when the
+    /// processor goes away. A `std::process::Child` is *not* killed on drop by
+    /// default, so without this the decoder (and a lazily-spawned encoder)
+    /// could linger after the app exits. In particular, dropping an idle
+    /// encoder's stdin would make FFmpeg finalize a stream over the output
+    /// path — corrupting an already-written MP4.
+    fn drop(&mut self) {
+        if let Some(mut encoder) = self.encoder.take() {
+            // Kill before stdin is closed so FFmpeg never finalizes a
+            // (potentially empty) stream onto the output file.
+            let _ = encoder.kill();
+            let _ = encoder.wait();
+        }
+        let _ = self.decoder.kill();
+        let _ = self.decoder.wait();
     }
 }

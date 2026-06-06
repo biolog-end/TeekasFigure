@@ -141,6 +141,52 @@ fn align_to(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }
 
+/// True if `name` matches the `frame_<digits>.png` output-sequence pattern
+/// (e.g. `frame_00042.png`).
+fn is_frame_sequence_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("frame_") else {
+        return false;
+    };
+    let Some(digits) = rest.strip_suffix(".png") else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Delete leftover `frame_NNNNN.png` files from a previous video run.
+///
+/// Video frames are written as `frame_00000.png`, `frame_00001.png`, … and
+/// later encoded by FFmpeg via the `frame_%05d.png` pattern. If a previous run
+/// produced MORE frames than the current one, the stale higher-numbered files
+/// would still be on disk and FFmpeg would append them to the new video (e.g. a
+/// new 200-frame run after an old 400-frame run yields a 400-frame mix). Always
+/// clearing them before a run guarantees the encoded video contains only the
+/// frames of the current run.
+///
+/// Only files matching the exact `frame_<digits>.png` pattern are removed;
+/// `*_result.png/.mp4` and `snapshot_*.png` are left untouched. Returns the
+/// number of files removed.
+pub fn clean_frame_sequence(output_folder: &Path) -> usize {
+    let read_dir = match std::fs::read_dir(output_folder) {
+        Ok(rd) => rd,
+        Err(_) => return 0, // folder doesn't exist yet — nothing to clean
+    };
+
+    let mut removed = 0;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            if is_frame_sequence_name(name) && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +249,48 @@ mod tests {
         assert_eq!(align_to(512, 256), 512);
         assert_eq!(align_to(100, 256), 256);
         assert_eq!(align_to(0, 256), 0);
+    }
+
+    #[test]
+    fn test_is_frame_sequence_name() {
+        assert!(is_frame_sequence_name("frame_00000.png"));
+        assert!(is_frame_sequence_name("frame_42.png"));
+        assert!(is_frame_sequence_name("frame_00399.png"));
+        // Non-matching names must be ignored.
+        assert!(!is_frame_sequence_name("frame_.png"));
+        assert!(!is_frame_sequence_name("frame_12.jpg"));
+        assert!(!is_frame_sequence_name("frame_12a.png"));
+        assert!(!is_frame_sequence_name("snapshot_20240101_000000.png"));
+        assert!(!is_frame_sequence_name("video_result.png"));
+        assert!(!is_frame_sequence_name("frame.png"));
+    }
+
+    #[test]
+    fn test_clean_frame_sequence_removes_only_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        // Stale frame sequence + files that must survive.
+        std::fs::write(p.join("frame_00000.png"), b"x").unwrap();
+        std::fs::write(p.join("frame_00001.png"), b"x").unwrap();
+        std::fs::write(p.join("frame_00399.png"), b"x").unwrap();
+        std::fs::write(p.join("video_result.mp4"), b"x").unwrap();
+        std::fs::write(p.join("video_result.png"), b"x").unwrap();
+        std::fs::write(p.join("snapshot_20240101_000000.png"), b"x").unwrap();
+
+        let removed = clean_frame_sequence(p);
+        assert_eq!(removed, 3);
+        assert!(!p.join("frame_00000.png").exists());
+        assert!(!p.join("frame_00399.png").exists());
+        // Survivors untouched.
+        assert!(p.join("video_result.mp4").exists());
+        assert!(p.join("video_result.png").exists());
+        assert!(p.join("snapshot_20240101_000000.png").exists());
+    }
+
+    #[test]
+    fn test_clean_frame_sequence_missing_folder_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist");
+        assert_eq!(clean_frame_sequence(&missing), 0);
     }
 }

@@ -205,11 +205,7 @@ impl HillClimber {
         scores: &[f32],
         n: usize,
     ) -> Vec<CandidateParams> {
-        let len = candidates.len().min(scores.len());
-        let mut indexed: Vec<(usize, f32)> = (0..len).map(|i| (i, scores[i])).collect();
-        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        indexed.iter().take(n).map(|(i, _)| candidates[*i]).collect()
+        top_n_by_score(candidates, scores, n)
     }
 
     /// Mutate a candidate: small random changes to position, rotation, scale, alpha.
@@ -221,46 +217,160 @@ impl HillClimber {
         generator: &mut CandidateGenerator,
         evolve_opacity: bool,
     ) -> CandidateParams {
-        let (cw, ch) = canvas_size;
+        mutate_candidate(parent, canvas_size, generator, evolve_opacity, &mut self.rng)
+    }
+}
 
-        // Position: ±10% of canvas size
-        let dx = self.rng.gen_range(-(cw as f32 * 0.1)..=(cw as f32 * 0.1));
-        let dy = self.rng.gen_range(-(ch as f32 * 0.1)..=(ch as f32 * 0.1));
-        let new_x = (parent.x + dx).clamp(0.0, (cw - 1) as f32);
-        let new_y = (parent.y + dy).clamp(0.0, (ch - 1) as f32);
+/// Mutate a candidate: small random changes to position, rotation, scale, alpha.
+/// Color is re-sampled from target at the new position.
+///
+/// Free function (takes an explicit `rng`) so the initial hill-climbing
+/// placement and video rebirth share the exact same mutation behaviour.
+pub fn mutate_candidate(
+    parent: &CandidateParams,
+    canvas_size: (u32, u32),
+    generator: &CandidateGenerator,
+    evolve_opacity: bool,
+    rng: &mut SmallRng,
+) -> CandidateParams {
+    let (cw, ch) = canvas_size;
 
-        // Rotation: ±0.5 radians
-        let dr = self.rng.gen_range(-0.5_f32..=0.5);
-        let new_rotation = (parent.rotation + dr).rem_euclid(std::f32::consts::TAU);
+    // Position: ±10% of canvas size
+    let dx = rng.gen_range(-(cw as f32 * 0.1)..=(cw as f32 * 0.1));
+    let dy = rng.gen_range(-(ch as f32 * 0.1)..=(ch as f32 * 0.1));
+    let new_x = (parent.x + dx).clamp(0.0, (cw - 1) as f32);
+    let new_y = (parent.y + dy).clamp(0.0, (ch - 1) as f32);
 
-        // Scale: ±30% (multiplicative), also allow slight X/Y stretch via scale
-        let scale_factor = self.rng.gen_range(0.7_f32..=1.3);
-        let new_scale = (parent.scale * scale_factor).clamp(0.02, 20.0);
+    // Rotation: ±0.5 radians
+    let dr = rng.gen_range(-0.5_f32..=0.5);
+    let new_rotation = (parent.rotation + dr).rem_euclid(std::f32::consts::TAU);
 
-        // Alpha: ±0.2 (or fixed at 1.0 if opacity evolution is disabled)
-        let new_alpha = if evolve_opacity {
-            let da = self.rng.gen_range(-0.2_f32..=0.2);
-            (parent.alpha + da).clamp(0.1, 1.0)
-        } else {
-            1.0
-        };
+    // Scale: ±30% (multiplicative)
+    let scale_factor = rng.gen_range(0.7_f32..=1.3);
+    let new_scale = (parent.scale * scale_factor).clamp(0.02, 20.0);
 
-        // Color: re-sample from target at new position
-        let (r, g, b) = generator.sample_color_at(new_x as u32, new_y as u32);
+    // Alpha: ±0.2 (or fixed at 1.0 if opacity evolution is disabled)
+    let new_alpha = if evolve_opacity {
+        let da = rng.gen_range(-0.2_f32..=0.2);
+        (parent.alpha + da).clamp(0.1, 1.0)
+    } else {
+        1.0
+    };
 
-        CandidateParams {
-            shape_index: parent.shape_index,
-            x: new_x,
-            y: new_y,
-            rotation: new_rotation,
-            scale: new_scale,
-            r,
-            g,
-            b,
-            alpha: new_alpha,
-            _padding: [0.0, 0.0, 0.0],
+    // Color: re-sample from target at new position
+    let (r, g, b) = generator.sample_color_at(new_x as u32, new_y as u32);
+
+    CandidateParams {
+        shape_index: parent.shape_index,
+        x: new_x,
+        y: new_y,
+        rotation: new_rotation,
+        scale: new_scale,
+        r,
+        g,
+        b,
+        alpha: new_alpha,
+        _padding: [0.0, 0.0, 0.0],
+    }
+}
+
+/// Select the top `n` candidates by fitness (lowest score = best).
+fn top_n_by_score(
+    candidates: &[CandidateParams],
+    scores: &[f32],
+    n: usize,
+) -> Vec<CandidateParams> {
+    let len = candidates.len().min(scores.len());
+    let mut indexed: Vec<(usize, f32)> = (0..len).map(|i| (i, scores[i])).collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.iter().take(n).map(|(i, _)| candidates[*i]).collect()
+}
+
+/// Run ONE full evolutionary search against the current canvas and return the
+/// best candidate found plus its fitness (delta error; negative = improves the
+/// canvas). This is the same cycle a hill-climbing `step` uses — generate a
+/// `batch_size` random population, then repeat `num_generations` times: keep the
+/// top `survival_rate` fraction and breed `children_per_parent` mutated children
+/// from each.
+///
+/// Unlike `HillClimber::step` it does NOT composite the winner, does NOT apply
+/// the `min_improvement` acceptance gate, and ignores diversity penalties — the
+/// caller decides whether to place the result. Used by video rebirth so a shape
+/// born to replace a dead one evolves exactly like an originally-placed shape.
+///
+/// `placed_shapes` only feeds the generator's adaptive scale (pass 0 for the
+/// full `scale_min..scale_max` range, e.g. when filling fresh gaps in video).
+pub fn evolve_best_candidate(
+    gpu: &GpuContext,
+    generator: &mut CandidateGenerator,
+    settings: &Settings,
+    placed_shapes: u32,
+    rng: &mut SmallRng,
+) -> Option<(CandidateParams, f32)> {
+    // Initial random population.
+    let mut population = generator.generate_batch(
+        settings.batch_size,
+        placed_shapes,
+        gpu.canvas_size,
+        gpu.num_shapes,
+    );
+    if population.is_empty() {
+        return None;
+    }
+
+    // Assign colors based on the target at each candidate's position.
+    for candidate in population.iter_mut() {
+        let (r, g, b) = generator.sample_color_at(candidate.x as u32, candidate.y as u32);
+        candidate.r = r;
+        candidate.g = g;
+        candidate.b = b;
+    }
+
+    let mut best_candidate: Option<CandidateParams> = None;
+    let mut best_score = f32::MAX;
+
+    for _gen in 0..settings.num_generations {
+        gpu.dispatch_mse_evaluation(&population);
+        let scores = gpu.read_fitness_scores();
+
+        for (i, &score) in scores.iter().enumerate().take(population.len()) {
+            if score < best_score {
+                best_score = score;
+                best_candidate = Some(population[i]);
+            }
+        }
+
+        let num_survivors = ((population.len() as f32 * settings.survival_rate) as usize).max(1);
+        let survivors = top_n_by_score(&population, &scores, num_survivors);
+
+        let mut next_gen =
+            Vec::with_capacity(survivors.len() * (1 + settings.children_per_parent as usize));
+        for parent in &survivors {
+            next_gen.push(*parent);
+            for _ in 0..settings.children_per_parent {
+                next_gen.push(mutate_candidate(
+                    parent,
+                    gpu.canvas_size,
+                    generator,
+                    settings.evolve_opacity,
+                    rng,
+                ));
+            }
+        }
+        population = next_gen;
+    }
+
+    // Final evaluation of the last generation.
+    gpu.dispatch_mse_evaluation(&population);
+    let scores = gpu.read_fitness_scores();
+    for (i, &score) in scores.iter().enumerate().take(population.len()) {
+        if score < best_score {
+            best_score = score;
+            best_candidate = Some(population[i]);
         }
     }
+
+    best_candidate.map(|c| (c, best_score))
 }
 
 /// Select the candidate with the lowest fitness score.

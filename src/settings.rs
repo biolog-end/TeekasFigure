@@ -40,11 +40,34 @@ mutations_per_shape = 10
 # Displacement penalty weight for video temporal coherence (0.0–100.0)
 displacement_weight = 0.01
 
+# Scene-change tolerance for video mode (-10.0–10.0). A living shape only dies when,
+# even at its best low-movement position with resampled color, it makes its own
+# region worse than this per-pixel error threshold (i.e. the target pixels under it
+# changed drastically — a real scene change). Larger = shapes are kept more
+# aggressively (denser, more coherent); smaller = shapes die more eagerly.
+# NEGATIVE values are allowed and make the test STRICT: a shape must actively
+# IMPROVE its region by at least |value| per pixel to survive (and a reborn shape
+# must improve by that much to be placed) — more turnover, more aggressive rebuild.
+scene_change_tolerance = 0.005
+
+# Number of linearly-interpolated frames inserted between two evolved keyframes (0–20).
+# 0 disables interpolation (every saved frame is fully evolved). When > 0, output
+# framerate becomes target_fps * (interpolation_steps + 1) and motion looks much smoother.
+interpolation_steps = 2
+
 # Target FPS for video processing (1–60). Video is resampled to this framerate.
 target_fps = 12
 
 # Whether shapes can have variable opacity (true) or always fully opaque (false)
 evolve_opacity = true
+
+# Whether existing shapes RE-COLOR themselves to match the new frame during video
+# adaptation (true) or keep their original color and only move/rotate/scale (false).
+# Default is false: a shape placed on frame 1 keeps its color for the whole video and
+# only its position/rotation/scale adapt. Set true for the old behaviour where shapes
+# resample the new frame's colors as they adapt. (Reborn shapes filling gaps always
+# take a fresh color regardless, since they have no previous color.)
+video_recolor = false
 
 # --- Evolution Algorithm Parameters ---
 
@@ -107,10 +130,19 @@ pub struct Settings {
     pub mutations_per_shape: u32,
     /// Displacement penalty weight for video temporal coherence (0.0–100.0).
     pub displacement_weight: f32,
+    /// Scene-change tolerance for video mode (-10.0–10.0). Per-pixel error threshold
+    /// above which a living shape is considered no longer matching the target and dies.
+    /// Negative values require a shape to actively improve its region to survive.
+    pub scene_change_tolerance: f32,
+    /// Number of linearly interpolated frames inserted between two evolved keyframes (0–20).
+    pub interpolation_steps: u32,
     /// Target FPS for video processing (1–60). Video is resampled to this framerate before processing.
     pub target_fps: u32,
     /// Whether shapes can have variable opacity (true) or are always fully opaque (false).
     pub evolve_opacity: bool,
+    /// Whether existing shapes re-color to the new frame during video adaptation (true)
+    /// or keep their original color and only adapt geometry (false). Default false.
+    pub video_recolor: bool,
     /// Number of evolutionary generations per shape placement (1–20).
     pub num_generations: u32,
     /// Minimum improvement threshold (negative). Shape rejected if best delta > this.
@@ -146,8 +178,11 @@ impl Default for Settings {
             shape_resolution: 128,
             mutations_per_shape: 10,
             displacement_weight: 0.01,
+            scene_change_tolerance: 0.005,
+            interpolation_steps: 2,
             target_fps: 12,
             evolve_opacity: true,
+            video_recolor: false,
             num_generations: 4,
             min_improvement: -0.5,
             use_min_improvement: true,
@@ -225,6 +260,8 @@ impl Settings {
         self.validate_u32("shape_resolution", self.shape_resolution, 16, 1024)?;
         self.validate_u32("mutations_per_shape", self.mutations_per_shape, 1, 50)?;
         self.validate_f32("displacement_weight", self.displacement_weight, 0.0, 100.0)?;
+        self.validate_f32("scene_change_tolerance", self.scene_change_tolerance, -10.0, 10.0)?;
+        self.validate_u32("interpolation_steps", self.interpolation_steps, 0, 20)?;
         self.validate_u32("target_fps", self.target_fps, 1, 60)?;
         self.validate_u32("num_generations", self.num_generations, 1, 20)?;
         self.validate_f32("min_improvement", self.min_improvement, -10000.0, 0.0)?;
@@ -281,14 +318,15 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.batch_size, 1000);
         assert_eq!(settings.max_shapes, 4000);
-        assert_eq!(settings.mutations_per_frame, 1);
+        assert_eq!(settings.mutations_per_frame, 10);
         assert_eq!(settings.max_texture_size, 512);
         assert_eq!(settings.vram_budget_mb, 2048);
         assert!((settings.scale_min - 0.02).abs() < f32::EPSILON);
-        assert!((settings.scale_max - 0.5).abs() < f32::EPSILON);
+        assert!((settings.scale_max - 8.0).abs() < f32::EPSILON);
         assert_eq!(settings.shape_resolution, 128);
         assert_eq!(settings.mutations_per_shape, 10);
-        assert!((settings.displacement_weight - 1.0).abs() < f32::EPSILON);
+        assert!((settings.displacement_weight - 0.01).abs() < f32::EPSILON);
+        assert_eq!(settings.interpolation_steps, 2);
     }
 
     #[test]
@@ -358,7 +396,7 @@ mod tests {
         assert_eq!(settings.batch_size, 2048);
         // All other fields should be defaults
         assert_eq!(settings.max_shapes, 4000);
-        assert_eq!(settings.mutations_per_frame, 1);
+        assert_eq!(settings.mutations_per_frame, 10);
     }
 
     #[test]
