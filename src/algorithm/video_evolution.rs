@@ -197,7 +197,9 @@ impl VideoEvolution {
             g: new_g,
             b: new_b,
             alpha: new_alpha,
-            _padding: [0.0, 0.0, 0.0],
+            scale_y: new_scale,
+            use_original_color: params.use_original_color,
+            _padding: 0.0,
         }
     }
 }
@@ -273,7 +275,9 @@ mod tests {
             g: 0.5,
             b: 0.5,
             alpha: 0.8,
-            _padding: [0.0, 0.0, 0.0],
+            scale_y: 0.5,
+            use_original_color: 0.0,
+            _padding: 0.0,
         };
         ve.record_shape(params);
         assert_eq!(ve.shape_list.len(), 1);
@@ -300,7 +304,9 @@ mod tests {
                 g: 0.0,
                 b: 0.0,
                 alpha: 0.5,
-                _padding: [0.0, 0.0, 0.0],
+                scale_y: 0.1,
+                use_original_color: 0.0,
+                _padding: 0.0,
             });
         }
         assert_eq!(ve.vacant_slots(100), 70);
@@ -320,7 +326,9 @@ mod tests {
                 g: 0.0,
                 b: 0.0,
                 alpha: 0.5,
-                _padding: [0.0, 0.0, 0.0],
+                scale_y: 0.1,
+                use_original_color: 0.0,
+                _padding: 0.0,
             });
         }
         assert_eq!(ve.vacant_slots(50), 0);
@@ -340,7 +348,9 @@ mod tests {
                 g: 0.0,
                 b: 0.0,
                 alpha: 0.5,
-                _padding: [0.0, 0.0, 0.0],
+                scale_y: 0.1,
+                use_original_color: 0.0,
+                _padding: 0.0,
             });
         }
         assert_eq!(ve.vacant_slots(50), 0);

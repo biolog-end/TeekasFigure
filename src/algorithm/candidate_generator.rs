@@ -77,6 +77,14 @@ impl CandidateGenerator {
             let y = self.rng.gen_range(0..canvas_height) as f32;
             let rotation = self.rng.gen_range(0.0..std::f32::consts::TAU);
             let scale = self.rng.gen_range(self.settings.scale_min..=adaptive_max);
+            // Per-axis (Y) scale. With non-uniform scaling enabled it is sampled
+            // independently so shapes can start stretched/squashed; otherwise it
+            // mirrors `scale` for classic uniform sizing.
+            let scale_y = if self.settings.evolve_non_uniform_scale {
+                self.rng.gen_range(self.settings.scale_min..=adaptive_max)
+            } else {
+                scale
+            };
             let alpha = if self.settings.evolve_opacity {
                 self.rng.gen_range(0.1..=1.0_f32)
             } else {
@@ -95,7 +103,9 @@ impl CandidateGenerator {
                 g,
                 b,
                 alpha,
-                _padding: [0.0, 0.0, 0.0],
+                scale_y,
+                use_original_color: if self.settings.use_original_colors { 1.0 } else { 0.0 },
+                _padding: 0.0,
             });
         }
 
@@ -284,7 +294,51 @@ mod tests {
 
         let batch = gen.generate_batch(10, 0, (32, 32), 2);
         for candidate in &batch {
-            assert_eq!(candidate._padding, [0.0, 0.0, 0.0]);
+            assert_eq!(candidate._padding, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_uniform_scale_sets_scale_y_equal() {
+        let settings = default_settings(); // evolve_non_uniform_scale = false
+        let target = solid_target(128, 128, 128, 32, 32);
+        let mut gen = CandidateGenerator::new(settings, target, (32, 32));
+
+        let batch = gen.generate_batch(50, 0, (32, 32), 2);
+        for candidate in &batch {
+            assert_eq!(candidate.scale, candidate.scale_y,
+                "uniform scaling must keep scale_y == scale");
+            assert_eq!(candidate.use_original_color, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_non_uniform_scale_allows_different_axes() {
+        let mut settings = default_settings();
+        settings.evolve_non_uniform_scale = true;
+        let target = solid_target(128, 128, 128, 32, 32);
+        let mut gen = CandidateGenerator::new(settings.clone(), target, (32, 32));
+
+        let batch = gen.generate_batch(200, 0, (32, 32), 2);
+        // At least one candidate should have differing axes (probabilistically certain).
+        let any_different = batch.iter().any(|c| (c.scale - c.scale_y).abs() > f32::EPSILON);
+        assert!(any_different, "non-uniform scaling should produce differing axis scales");
+        for candidate in &batch {
+            assert!(candidate.scale_y >= settings.scale_min && candidate.scale_y <= settings.scale_max,
+                "scale_y out of bounds: {}", candidate.scale_y);
+        }
+    }
+
+    #[test]
+    fn test_original_colors_flag_set() {
+        let mut settings = default_settings();
+        settings.use_original_colors = true;
+        let target = solid_target(128, 128, 128, 32, 32);
+        let mut gen = CandidateGenerator::new(settings, target, (32, 32));
+
+        let batch = gen.generate_batch(10, 0, (32, 32), 2);
+        for candidate in &batch {
+            assert_eq!(candidate.use_original_color, 1.0);
         }
     }
 }

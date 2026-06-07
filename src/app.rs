@@ -1,9 +1,16 @@
-// Application struct and main event loop using winit 0.30 ApplicationHandler trait
+// Application struct and main event loop using winit 0.30 ApplicationHandler trait.
+//
+// The app runs in a single window with two screens:
+//   * Screen::Settings    — the egui configuration form (start state)
+//   * Screen::Generation  — the live approximation + statistics overlay
+//
+// Pressing "Start" in the Settings screen loads the chosen media + shapes,
+// builds the GPU resources on the already-created device, and switches to the
+// Generation screen. The window + surface + egui are shared across both.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::EventLoop;
@@ -11,11 +18,13 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
 
 use crate::algorithm::{CandidateGenerator, HillClimber};
+use crate::error::AppError;
 use crate::gpu::GpuContext;
 use crate::io;
 use crate::overlay::OverlayState;
 use crate::settings::Settings;
 use crate::types::{GenerationState, StepResult};
+use crate::ui::{Language, ScreenAction, SettingsScreen};
 
 /// Compute window dimensions that fit within 90% of the display while preserving aspect ratio.
 ///
@@ -54,119 +63,124 @@ pub fn compute_window_size(target_size: (u32, u32), display_size: (u32, u32)) ->
     (new_w.max(1), new_h.max(1))
 }
 
-/// Holds all application state for the GPU Image Approximator.
-///
-/// Manages the GPU context, algorithm state, overlay, egui integration,
-/// and the winit event loop via the `ApplicationHandler` trait.
-pub struct App {
-    /// GPU resources: device, queue, textures, buffers, pipelines
+/// Build a surface configuration for the given size/format (device-independent).
+fn make_surface_config(
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::SurfaceConfiguration {
+    wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: width.max(1),
+        height: height.max(1),
+        present_mode: wgpu::PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![],
+    }
+}
+
+/// The two screens the window can display.
+enum Screen {
+    /// Configuration form (start state).
+    Settings(SettingsScreen),
+    /// Live generation + overlay.
+    Generation(Box<GenerationContext>),
+}
+
+/// All state that only exists while generation is running.
+pub struct GenerationContext {
     pub gpu: GpuContext,
-    /// Hill climbing algorithm state
     pub climber: HillClimber,
-    /// Candidate batch generator
     pub generator: CandidateGenerator,
-    /// egui overlay state (statistics + notifications)
     pub overlay: OverlayState,
-    /// Application settings
     pub settings: Settings,
-    /// The winit window (wrapped in Arc for wgpu surface compatibility)
-    pub window: Arc<Window>,
-    /// Computed window dimensions (width, height)
-    pub window_size: (u32, u32),
-    /// The wgpu surface for presenting frames
-    pub surface: wgpu::Surface<'static>,
-    /// egui winit integration state
-    pub egui_state: egui_winit::State,
-    /// egui wgpu renderer
-    pub egui_renderer: egui_wgpu::Renderer,
-    /// egui context
-    pub egui_ctx: egui::Context,
-    /// Path to the source media file (for completion filename derivation)
     pub source_path: PathBuf,
-    /// Path to the output folder
     pub output_folder: PathBuf,
-    /// Whether auto-save on completion has been performed
     auto_saved: bool,
-    /// Frame timing for FPS calculation
-    frame_times: Vec<Instant>,
-    /// Last frame timestamp
-    last_frame: Instant,
-    /// Video pipeline state (None for image mode)
     pub video_pipeline: Option<crate::algorithm::VideoPipeline>,
-    /// Video decoder process (None for image mode)
     pub video_decoder: Option<crate::io::video::VideoProcessor>,
-    /// Index of the next output frame file (used for video PNG names so we
-    /// can interleave keyframes and interpolated frames in a single sequence).
+    /// Index of the next output frame file (video PNG sequence).
     output_frame_index: u32,
+    /// Captured (downscaled) frames for the image-mode progress GIF.
+    gif_frames: Vec<image::RgbaImage>,
+    /// Placed-shape count at which the next GIF frame should be captured.
+    gif_next_capture: u32,
+    /// Placed-shape interval between GIF captures.
+    gif_capture_stride: u32,
+}
+
+/// Holds all shared application state and the active screen.
+pub struct App {
+    /// Shared GPU device (cloned into GpuContext on Start).
+    device: Arc<wgpu::Device>,
+    /// Shared GPU queue.
+    queue: Arc<wgpu::Queue>,
+    /// The wgpu surface for presenting frames.
+    surface: wgpu::Surface<'static>,
+    /// Surface texture format.
+    surface_format: wgpu::TextureFormat,
+    /// The winit window (Arc for wgpu surface compatibility).
+    window: Arc<Window>,
+    /// egui winit integration state.
+    egui_state: egui_winit::State,
+    /// egui wgpu renderer.
+    egui_renderer: egui_wgpu::Renderer,
+    /// egui context.
+    egui_ctx: egui::Context,
+    /// Base directory (for shapes, output, presets).
+    base_dir: PathBuf,
+    /// Output folder.
+    output_folder: PathBuf,
+    /// Active screen.
+    screen: Screen,
+    /// Frame timing for FPS calculation.
+    frame_times: Vec<Instant>,
 }
 
 impl App {
-    /// Create a new App with all components initialized.
-    ///
-    /// # Arguments
-    /// * `gpu` - Initialized GPU context with all resources
-    /// * `climber` - Hill climbing algorithm state
-    /// * `generator` - Candidate batch generator
-    /// * `overlay` - egui overlay state
-    /// * `settings` - Application settings
-    /// * `window` - The winit window
-    /// * `surface` - The wgpu surface for presentation
-    /// * `egui_state` - egui winit integration state
-    /// * `egui_renderer` - egui wgpu renderer
-    /// * `source_path` - Path to the source media file
-    /// * `output_folder` - Path to the output folder
+    /// Create a new App starting on the Settings screen.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        gpu: GpuContext,
-        climber: HillClimber,
-        generator: CandidateGenerator,
-        overlay: OverlayState,
-        settings: Settings,
-        window: Arc<Window>,
-        window_size: (u32, u32),
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         surface: wgpu::Surface<'static>,
+        surface_format: wgpu::TextureFormat,
+        window: Arc<Window>,
         egui_state: egui_winit::State,
         egui_renderer: egui_wgpu::Renderer,
-        source_path: PathBuf,
-        output_folder: PathBuf,
+        egui_ctx: egui::Context,
+        base_dir: PathBuf,
+        settings: Settings,
+        language: Language,
     ) -> Self {
-        let is_video = overlay.is_video;
-        let egui_ctx = egui::Context::default();
-        let now = Instant::now();
-
-        // Configure the surface
+        // Configure the surface for the initial (settings) window size.
         let size = window.inner_size();
-        let config = gpu.create_surface_config(size.width, size.height, gpu.surface_format);
-        surface.configure(&gpu.device, &config);
+        surface.configure(&device, &make_surface_config(size.width, size.height, surface_format));
+
+        let settings_screen = SettingsScreen::new(&base_dir, settings, language);
+        let output_folder = base_dir.join("output");
 
         Self {
-            gpu,
-            climber,
-            generator,
-            overlay,
-            settings,
-            window,
-            window_size,
+            device,
+            queue,
             surface,
+            surface_format,
+            window,
             egui_state,
             egui_renderer,
             egui_ctx,
-            source_path,
+            base_dir,
             output_folder,
-            auto_saved: false,
+            screen: Screen::Settings(settings_screen),
             frame_times: Vec::with_capacity(60),
-            last_frame: now,
-            video_pipeline: if is_video { Some(crate::algorithm::VideoPipeline::new()) } else { None },
-            video_decoder: None,
-            output_frame_index: 0,
         }
     }
 
     /// Run the application event loop. Consumes self and the event loop.
     pub fn run(self, event_loop: EventLoop<()>) {
-        let mut app_handler = AppHandler {
-            app: Some(self),
-        };
+        let mut app_handler = AppHandler { app: Some(self) };
         event_loop.run_app(&mut app_handler).unwrap();
     }
 
@@ -174,16 +188,12 @@ impl App {
     fn compute_fps(&mut self) -> f32 {
         let now = Instant::now();
         self.frame_times.push(now);
-
-        // Keep only the last 60 frame timestamps for rolling average
         if self.frame_times.len() > 60 {
             self.frame_times.remove(0);
         }
-
         if self.frame_times.len() < 2 {
             return 0.0;
         }
-
         let oldest = self.frame_times[0];
         let elapsed = now.duration_since(oldest).as_secs_f32();
         if elapsed > 0.0 {
@@ -193,22 +203,311 @@ impl App {
         }
     }
 
+    /// Reconfigure the surface for a new size.
+    fn reconfigure_surface(&self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.surface
+            .configure(&self.device, &make_surface_config(width, height, self.surface_format));
+    }
+
+    /// Transition from Settings to Generation: load media + shapes, build GPU
+    /// resources on the shared device, and assemble the GenerationContext.
+    fn begin_generation(
+        &mut self,
+        media_path: PathBuf,
+        settings: Settings,
+        language: Language,
+    ) -> Result<GenerationContext, AppError> {
+        // 1. Load the target frame (image, or first frame of a video).
+        let (target_data, target_size, is_video) = io::media_loader::load_target(&media_path)?;
+        log::info!(
+            "Media loaded: {}x{}, is_video={}",
+            target_size.0,
+            target_size.1,
+            is_video
+        );
+
+        // 2. Resize the window to fit the media within 90% of the display.
+        let display_size = self
+            .window
+            .current_monitor()
+            .map(|m| {
+                let s = m.size();
+                (s.width, s.height)
+            })
+            .unwrap_or((1920, 1080));
+        let win_size = compute_window_size(target_size, display_size);
+        let _ = self
+            .window
+            .request_inner_size(winit::dpi::PhysicalSize::new(win_size.0, win_size.1));
+        self.reconfigure_surface(win_size.0, win_size.1);
+
+        // 3. Load and preprocess shapes (raw_shapes/ keeps original colors).
+        let (shapes_folder, preserve_color) = if settings.use_original_colors {
+            (self.base_dir.join("raw_shapes"), true)
+        } else {
+            (self.base_dir.join("input_shapes"), false)
+        };
+        log::info!(
+            "Loading shapes from '{}' (original colors: {})",
+            shapes_folder.display(),
+            settings.use_original_colors
+        );
+        let shapes = io::shape_preprocessor::load_and_preprocess(
+            &shapes_folder,
+            settings.shape_resolution,
+            preserve_color,
+        )?;
+        io::shape_preprocessor::check_vram_budget(
+            settings.shape_resolution,
+            shapes.len() as u32,
+            settings.vram_budget_mb,
+        )?;
+        log::info!("Loaded {} shape(s)", shapes.len());
+
+        // 4. Build GPU resources on the shared device.
+        let gpu = GpuContext::new_from_device(
+            self.device.clone(),
+            self.queue.clone(),
+            self.surface_format,
+            &target_data,
+            target_size,
+            &shapes,
+            &settings,
+        )?;
+
+        // 5. Algorithm components.
+        let climber = HillClimber::new();
+        let generator = CandidateGenerator::new(settings.clone(), target_data, target_size);
+        let overlay = OverlayState::with_language(settings.max_shapes, is_video, language);
+
+        let mut ctx = GenerationContext {
+            gpu,
+            climber,
+            generator,
+            overlay,
+            settings: settings.clone(),
+            source_path: media_path.clone(),
+            output_folder: self.output_folder.clone(),
+            auto_saved: false,
+            video_pipeline: if is_video {
+                Some(crate::algorithm::VideoPipeline::new())
+            } else {
+                None
+            },
+            video_decoder: None,
+            output_frame_index: 0,
+            gif_frames: Vec::new(),
+            // Spread ~gif_frames captures across the placement process. Only
+            // collect for image mode when the toggle is on.
+            gif_next_capture: if !is_video && settings.save_progress_gif {
+                (settings.max_shapes / settings.gif_frames.max(1)).max(1)
+            } else {
+                u32::MAX
+            },
+            gif_capture_stride: (settings.max_shapes / settings.gif_frames.max(1)).max(1),
+        };
+
+        // 6. Video decoder setup.
+        if is_video {
+            let removed = io::output::clean_frame_sequence(&self.output_folder);
+            if removed > 0 {
+                log::info!("Removed {} leftover frame_*.png file(s) from a previous run", removed);
+            }
+            let stem = media_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("video");
+            let output_video = self.output_folder.join(format!("{}_result.mp4", stem));
+            match crate::io::video::VideoProcessor::new(&media_path, &output_video, settings.target_fps) {
+                Ok(decoder) => {
+                    ctx.video_decoder = Some(decoder);
+                    log::info!("Video decoder initialized");
+                }
+                Err(e) => {
+                    log::warn!("Failed to init video decoder: {}. Processing as single image.", e);
+                }
+            }
+        }
+
+        self.window
+            .set_title("TeekasFigure - Running  (Space: pause, S: snapshot, Esc: quit)");
+        Ok(ctx)
+    }
+
+    /// Render a frame for whichever screen is active.
+    fn render_frame(&mut self) {
+        let fps = self.compute_fps();
+        if let Screen::Generation(ref mut g) = self.screen {
+            g.overlay.fps = fps;
+            g.overlay.placed_shapes = g
+                .video_pipeline
+                .as_ref()
+                .map(|p| p.shapes.len() as u32)
+                .unwrap_or(g.climber.placed_shapes);
+            g.overlay.current_mse = g.climber.current_mse;
+        }
+
+        // Acquire surface texture.
+        let surface_texture = match self.surface.get_current_texture() {
+            Ok(tex) => tex,
+            Err(wgpu::SurfaceError::Lost) => {
+                let size = self.window.inner_size();
+                self.reconfigure_surface(size.width, size.height);
+                return;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                log::error!("Out of GPU memory for surface texture");
+                return;
+            }
+            Err(e) => {
+                log::warn!("Surface texture error: {:?}", e);
+                return;
+            }
+        };
+
+        let surface_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Frame Encoder"),
+        });
+
+        // Background: blit the canvas (generation) or clear to dark (settings).
+        match &self.screen {
+            Screen::Generation(g) => {
+                g.gpu.blit_canvas_to_surface(&mut encoder, &surface_view);
+            }
+            Screen::Settings(_) => {
+                let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Settings Clear Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surface_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.06,
+                                b: 0.09,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+            }
+        }
+
+        // Run egui for the active screen, capturing any requested action.
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let ctx = self.egui_ctx.clone();
+        let mut start_request: Option<(PathBuf, Settings, Language)> = None;
+        let full_output = ctx.run(raw_input, |ectx| match &mut self.screen {
+            Screen::Settings(s) => {
+                if let ScreenAction::Start {
+                    media_path,
+                    settings,
+                    language,
+                } = s.render(ectx)
+                {
+                    start_request = Some((media_path, settings, language));
+                }
+            }
+            Screen::Generation(g) => {
+                g.overlay.render(ectx);
+            }
+        });
+
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [
+                self.window.inner_size().width.max(1),
+                self.window.inner_size().height.max(1),
+            ],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+
+        self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let mut render_pass = render_pass.forget_lifetime();
+            self.egui_renderer
+                .render(&mut render_pass, &paint_jobs, &screen_descriptor);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        // Handle a Start request after rendering (so the settings screen exists
+        // when we need to report errors).
+        if let Some((media_path, settings, language)) = start_request {
+            match self.begin_generation(media_path, settings, language) {
+                Ok(gen) => {
+                    self.frame_times.clear();
+                    self.screen = Screen::Generation(Box::new(gen));
+                }
+                Err(e) => {
+                    log::error!("Failed to start generation: {}", e);
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.set_status(format!("{}", e), true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl GenerationContext {
     /// Execute generation iterations for the current frame.
-    ///
-    /// Runs up to `mutations_per_frame` successful iterations (Accepted results).
-    /// Skips generation if paused or completed.
-    /// Auto-saves on completion (max_shapes reached).
-    fn run_generation_step(&mut self) {
+    fn run_generation_step(&mut self, window: &Window) {
         if self.climber.state != GenerationState::Running {
             return;
         }
 
         let mutations_per_frame = self.settings.mutations_per_frame;
         let mut accepted_count = 0u32;
-
-        // Keep stepping until we get the required number of accepted mutations
-        // or hit a completion/error state. Limit total attempts to avoid infinite loops.
-        let max_attempts = mutations_per_frame * 100; // Safety limit
+        let max_attempts = mutations_per_frame * 100;
         let mut attempts = 0u32;
 
         while accepted_count < mutations_per_frame && attempts < max_attempts {
@@ -218,7 +517,6 @@ impl App {
             match result {
                 StepResult::Accepted(candidate) => {
                     accepted_count += 1;
-                    // Record shape in video pipeline for temporal coherence
                     if let Some(ref mut pipeline) = self.video_pipeline {
                         pipeline.record_placed_shape(candidate);
                     }
@@ -230,70 +528,110 @@ impl App {
                         );
                     }
                 }
-                StepResult::Rejected => {
-                    // Continue trying
-                }
+                StepResult::Rejected => {}
                 StepResult::Completed => {
-                    // Generation finished — auto-save
-                    self.auto_save_on_completion();
+                    self.auto_save_on_completion(window);
                     break;
                 }
                 StepResult::Error(msg) => {
                     log::error!("Generation step error: {}", msg);
-                    self.overlay.add_notification(
-                        format!("Generation error: {}", msg),
-                        5.0,
-                        true,
-                    );
+                    self.overlay.add_notification(format!("Generation error: {}", msg), 5.0, true);
                     break;
                 }
             }
         }
+
+        self.maybe_capture_gif_frame();
+    }
+
+    /// Capture a downscaled canvas frame for the progress GIF when the next
+    /// placed-shape threshold is reached (no-op unless enabled in image mode).
+    fn maybe_capture_gif_frame(&mut self) {
+        if self.climber.placed_shapes < self.gif_next_capture {
+            return;
+        }
+        match io::output::read_canvas_image(&self.gpu) {
+            Ok(img) => {
+                let img = io::output::downscale_to_width(img, self.settings.gif_max_width);
+                self.gif_frames.push(img);
+            }
+            Err(e) => log::warn!("Progress GIF frame capture failed: {}", e),
+        }
+        self.gif_next_capture = self
+            .gif_next_capture
+            .saturating_add(self.gif_capture_stride.max(1));
     }
 
     /// Auto-save the canvas when generation completes (max_shapes reached).
-    fn auto_save_on_completion(&mut self) {
+    fn auto_save_on_completion(&mut self, window: &Window) {
         if self.auto_saved {
             return;
         }
 
-        // Check if we're in video mode and have more frames
         if self.overlay.is_video {
-            self.handle_video_frame_complete();
+            self.handle_video_frame_complete(window);
             return;
         }
 
-        // Image mode: just save
         self.auto_saved = true;
-        self.window.set_title("GPU Image Approximator - Completed");
+        window.set_title("TeekasFigure - Completed");
 
         let filename = io::output::completion_filename(&self.source_path);
         match io::output::save_canvas_png(&self.gpu, &self.output_folder, &filename) {
             Ok(path) => {
                 log::info!("Auto-save on completion: {}", path.display());
-                self.overlay.add_notification(
-                    format!("Completed! Saved: {}", filename),
-                    5.0,
-                    false,
-                );
+                self.overlay
+                    .add_notification(format!("Completed! Saved: {}", filename), 5.0, false);
             }
             Err(e) => {
                 log::error!("Auto-save failed: {}", e);
-                self.overlay.add_notification(
-                    format!("Auto-save failed: {}", e),
-                    5.0,
-                    true,
-                );
+                self.overlay
+                    .add_notification(format!("Auto-save failed: {}", e), 5.0, true);
             }
         }
+
+        self.save_progress_gif_if_enabled();
+    }
+
+    /// Assemble and save the progress GIF (image mode) if enabled and frames
+    /// were captured. Captures one final frame of the completed canvas first.
+    fn save_progress_gif_if_enabled(&mut self) {
+        if !self.settings.save_progress_gif {
+            return;
+        }
+        // Always include the finished canvas as the last frame.
+        if let Ok(img) = io::output::read_canvas_image(&self.gpu) {
+            self.gif_frames
+                .push(io::output::downscale_to_width(img, self.settings.gif_max_width));
+        }
+        if self.gif_frames.is_empty() {
+            return;
+        }
+        let gif_name = io::output::process_gif_filename(&self.source_path);
+        match io::output::save_progress_gif(
+            &self.gif_frames,
+            &self.output_folder,
+            &gif_name,
+            self.settings.gif_fps,
+        ) {
+            Ok(path) => {
+                log::info!("Saved progress GIF ({} frames): {}", self.gif_frames.len(), path.display());
+                self.overlay
+                    .add_notification(format!("Saved GIF: {}", gif_name), 6.0, false);
+            }
+            Err(e) => {
+                log::error!("Progress GIF save failed: {}", e);
+                self.overlay
+                    .add_notification(format!("GIF save failed: {}", e), 6.0, true);
+            }
+        }
+        // Free the captured frames now that the GIF is written.
+        self.gif_frames = Vec::new();
     }
 
     /// Handle video frame completion: save current frame, advance to next.
-    fn handle_video_frame_complete(&mut self) {
-        // Generation just finished a keyframe. Before we save it, render the
-        // intermediate (interpolated) frames between the previous keyframe
-        // and the current one — this fills in motion blur-like smoothness
-        // without running evolution on every output frame.
+    fn handle_video_frame_complete(&mut self, window: &Window) {
+        // Render interpolated frames between the previous and current keyframe.
         let interp = self.settings.interpolation_steps;
         if interp > 0 && self.overlay.frame_number > 0 {
             if let Some(ref pipeline) = self.video_pipeline {
@@ -302,23 +640,18 @@ impl App {
                     pipeline.render_interpolated_frame(&self.gpu, t);
                     let inter_filename = format!("frame_{:05}.png", self.output_frame_index);
                     self.output_frame_index += 1;
-                    if let Err(e) = io::output::save_canvas_png(
-                        &self.gpu,
-                        &self.output_folder,
-                        &inter_filename,
-                    ) {
+                    if let Err(e) =
+                        io::output::save_canvas_png(&self.gpu, &self.output_folder, &inter_filename)
+                    {
                         log::error!("Failed to save interpolated frame {}: {}", inter_filename, e);
                     } else {
                         log::debug!("Saved interpolated frame: {}", inter_filename);
                     }
                 }
-                // Restore the canvas to the actual current keyframe state so
-                // the next save captures the evolved result, not the last lerp.
                 pipeline.rebuild_canvas(&self.gpu);
             }
         }
 
-        // Save current keyframe as PNG (next slot in the global sequence).
         let frame_num = self.overlay.frame_number;
         log::info!(
             "Frame {} complete with {} shapes in pipeline",
@@ -328,18 +661,12 @@ impl App {
         let filename = format!("frame_{:05}.png", self.output_frame_index);
         self.output_frame_index += 1;
         match io::output::save_canvas_png(&self.gpu, &self.output_folder, &filename) {
-            Ok(path) => {
-                log::info!("Saved video keyframe: {}", path.display());
-            }
-            Err(e) => {
-                log::error!("Failed to save frame {}: {}", frame_num, e);
-            }
+            Ok(path) => log::info!("Saved video keyframe: {}", path.display()),
+            Err(e) => log::error!("Failed to save frame {}: {}", frame_num, e),
         }
 
-        // Try to load next frame from video decoder
         if let Some(ref mut decoder) = self.video_decoder {
             if let Some(frame_data) = decoder.next_frame() {
-                // Update target texture with new frame
                 self.gpu.queue.write_texture(
                     wgpu::ImageCopyTexture {
                         texture: &self.gpu.target,
@@ -360,39 +687,28 @@ impl App {
                     },
                 );
 
-                // Update generator's target pixels for color sampling
                 self.generator = CandidateGenerator::new(
                     self.settings.clone(),
                     frame_data,
                     self.gpu.canvas_size,
                 );
 
-                // Adapt existing shapes to new frame
                 if let Some(ref mut pipeline) = self.video_pipeline {
                     let before = pipeline.shapes.len();
-                    let dead = pipeline.adapt_to_new_frame(&self.gpu, &mut self.generator, &self.settings);
+                    let dead =
+                        pipeline.adapt_to_new_frame(&self.gpu, &mut self.generator, &self.settings);
                     log::info!(
                         "Frame {}: adapted {} shapes, {} died (scene change), {} remain",
-                        frame_num + 1, before, dead, pipeline.shapes.len()
+                        frame_num + 1,
+                        before,
+                        dead,
+                        pipeline.shapes.len()
                     );
-
-                    // Rebuild canvas from adapted shapes
                     pipeline.rebuild_canvas(&self.gpu);
                 }
 
-                // The pipeline already produced a full-population canvas for
-                // this frame: surviving shapes adapted in place (GEOMETRY only —
-                // they keep their color unless `video_recolor` is on) and every
-                // dead shape was reborn via a full evolution. There is nothing
-                // for the generic hill-climber refill to do here.
-                //
-                // Running the refill (as before) repainted the canvas with
-                // brand-new shapes coloured from the CURRENT frame every single
-                // frame — which looks exactly like the whole image "re-coloring"
-                // itself and completely defeats `video_recolor=false`. So we
-                // mark the climber as already full: its next `step` returns
-                // Completed, which simply advances us to the next video frame
-                // (no new shapes, no repaint).
+                // Population is frozen after frame 0: mark the climber as full so
+                // its next step Completes and simply advances to the next frame.
                 self.climber = HillClimber::new();
                 self.climber.placed_shapes = self.settings.max_shapes;
                 if let Some(ref pipeline) = self.video_pipeline {
@@ -409,225 +725,145 @@ impl App {
                     .map(|p| p.shapes.len() as u32)
                     .unwrap_or(self.climber.placed_shapes);
 
-                self.window.set_title(&format!(
-                    "GPU Image Approximator - Frame {} - Running",
+                window.set_title(&format!(
+                    "TeekasFigure - Frame {} - Running",
                     self.overlay.frame_number
                 ));
             } else {
-                // No more frames — video complete
-                self.auto_saved = true;
-                self.climber.state = crate::types::GenerationState::Completed;
-                self.window.set_title("GPU Image Approximator - Video Complete");
-                self.overlay.add_notification("Video processing complete!".to_string(), 10.0, false);
-
-                // Encode all frames to MP4
-                log::info!("All frames processed, encoding to MP4...");
-                let stem = self.source_path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("video");
-                let output_mp4 = self.output_folder.join(format!("{}_result.mp4", stem));
-
-                let fps = if let Some(ref decoder) = self.video_decoder {
-                    decoder.fps
-                } else {
-                    30.0
-                };
-                // If interpolation is enabled, the output sequence has
-                // (interpolation_steps + 1) frames per keyframe, so the
-                // playback fps must scale up to keep wall-clock duration.
-                let output_fps = fps * (self.settings.interpolation_steps as f64 + 1.0);
-
-                // Use FFmpeg to encode saved frames to MP4
-                let frames_pattern = self.output_folder.join("frame_%05d.png");
-                let encode_result = std::process::Command::new("ffmpeg")
-                    .args([
-                        "-y",
-                        "-framerate", &format!("{}", output_fps),
-                        "-i", frames_pattern.to_str().unwrap_or(""),
-                        "-c:v", "libx264",
-                        "-pix_fmt", "yuv420p",
-                        "-v", "quiet",
-                        output_mp4.to_str().unwrap_or(""),
-                    ])
-                    .output();
-
-                // Only report success once the MP4 actually exists on disk AND
-                // is non-empty — i.e. the file is fully written and playable,
-                // not still being produced. FFmpeg returning success but
-                // leaving a 0-byte/missing file (e.g. no frames, disk error)
-                // must be treated as a failure.
-                let encoded_ok = matches!(&encode_result, Ok(o) if o.status.success());
-                let file_ready = std::fs::metadata(&output_mp4)
-                    .map(|m| m.is_file() && m.len() > 0)
-                    .unwrap_or(false);
-
-                if encoded_ok && file_ready {
-                    let size_bytes = std::fs::metadata(&output_mp4).map(|m| m.len()).unwrap_or(0);
-                    let total_frames = self.output_frame_index;
-                    // Explicit, unambiguous completion log: the file exists and
-                    // is ready to play at this point.
-                    log::info!(
-                        "VIDEO READY: '{}' written ({} frames, {} bytes). The file is complete and playable.",
-                        output_mp4.display(), total_frames, size_bytes
-                    );
-                    println!(
-                        "VIDEO READY: {} ({} frames, {} bytes) — file is complete and playable.",
-                        output_mp4.display(), total_frames, size_bytes
-                    );
-                    self.window.set_title("GPU Image Approximator - Video Ready (file saved)");
-                    self.overlay.add_notification(
-                        format!("Video ready: {}", output_mp4.display()),
-                        15.0,
-                        false,
-                    );
-                } else {
-                    let detail = match &encode_result {
-                        Ok(o) if !o.status.success() => {
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            format!("ffmpeg exited with {}: {}", o.status, stderr.trim())
-                        }
-                        Ok(_) => "ffmpeg succeeded but output file is missing or empty".to_string(),
-                        Err(e) => format!("failed to launch ffmpeg: {}", e),
-                    };
-                    log::error!("FFmpeg encoding failed: {}", detail);
-                    self.window.set_title("GPU Image Approximator - Video encoding FAILED");
-                    self.overlay.add_notification(
-                        format!("Video encoding failed: {}", detail),
-                        15.0,
-                        true,
-                    );
-                }
+                self.finalize_video(window);
             }
         } else {
-            // No decoder — shouldn't happen in video mode
             self.auto_saved = true;
-            self.climber.state = crate::types::GenerationState::Completed;
+            self.climber.state = GenerationState::Completed;
         }
     }
 
-    /// Render a frame: copy canvas to surface, render egui overlay, present.
-    fn render_frame(&mut self) {
-        // Compute FPS
-        let fps = self.compute_fps();
-        self.overlay.fps = fps;
+    /// Encode the saved frames into the final MP4.
+    fn finalize_video(&mut self, window: &Window) {
+        self.auto_saved = true;
+        self.climber.state = GenerationState::Completed;
+        window.set_title("TeekasFigure - Video Complete");
+        self.overlay
+            .add_notification("Video processing complete!".to_string(), 10.0, false);
 
-        // Update overlay state from algorithm
-        self.overlay.placed_shapes = self
-            .video_pipeline
-            .as_ref()
-            .map(|p| p.shapes.len() as u32)
-            .unwrap_or(self.climber.placed_shapes);
-        self.overlay.current_mse = self.climber.current_mse;
+        log::info!("All frames processed, encoding to MP4...");
+        let stem = self
+            .source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video");
+        let output_mp4 = self.output_folder.join(format!("{}_result.mp4", stem));
 
-        // Get surface texture
-        let surface_texture = match self.surface.get_current_texture() {
-            Ok(tex) => tex,
-            Err(wgpu::SurfaceError::Lost) => {
-                // Reconfigure surface
-                let size = self.window.inner_size();
-                let config = self.gpu.create_surface_config(size.width, size.height, self.gpu.surface_format);
-                self.surface.configure(&self.gpu.device, &config);
-                return;
-            }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                log::error!("Out of GPU memory for surface texture");
-                return;
+        let fps = self.video_decoder.as_ref().map(|d| d.fps).unwrap_or(30.0);
+        let output_fps = fps * (self.settings.interpolation_steps as f64 + 1.0);
+
+        let frames_pattern = self.output_folder.join("frame_%05d.png");
+
+        // Build the FFmpeg args. When audio preservation is on, add the source
+        // video as a second input and map its audio stream (optional via "?"),
+        // so a source without audio still encodes fine.
+        let framerate = format!("{}", output_fps);
+        let frames_pattern_str = frames_pattern.to_str().unwrap_or("").to_string();
+        let output_mp4_str = output_mp4.to_str().unwrap_or("").to_string();
+        let source_str = self.source_path.to_str().unwrap_or("").to_string();
+
+        let mut args: Vec<String> = vec![
+            "-y".into(),
+            "-framerate".into(),
+            framerate,
+            "-i".into(),
+            frames_pattern_str,
+        ];
+
+        let want_audio = self.settings.preserve_audio && !source_str.is_empty();
+        if want_audio {
+            args.push("-i".into());
+            args.push(source_str);
+            args.push("-map".into());
+            args.push("0:v:0".into());
+            args.push("-map".into());
+            args.push("1:a:0?".into()); // optional: skip if source has no audio
+            args.push("-c:a".into());
+            args.push("aac".into());
+            args.push("-shortest".into());
+        }
+
+        args.push("-c:v".into());
+        args.push("libx264".into());
+        args.push("-pix_fmt".into());
+        args.push("yuv420p".into());
+        args.push("-v".into());
+        args.push("quiet".into());
+        args.push(output_mp4_str);
+
+        let encode_result = std::process::Command::new("ffmpeg").args(&args).output();
+
+        let encoded_ok = matches!(&encode_result, Ok(o) if o.status.success());
+        let file_ready = std::fs::metadata(&output_mp4)
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false);
+
+        if encoded_ok && file_ready {
+            let size_bytes = std::fs::metadata(&output_mp4).map(|m| m.len()).unwrap_or(0);
+            let total_frames = self.output_frame_index;
+            log::info!(
+                "VIDEO READY: '{}' written ({} frames, {} bytes). The file is complete and playable.",
+                output_mp4.display(), total_frames, size_bytes
+            );
+            println!(
+                "VIDEO READY: {} ({} frames, {} bytes) — file is complete and playable.",
+                output_mp4.display(),
+                total_frames,
+                size_bytes
+            );
+            window.set_title("TeekasFigure - Video Ready (file saved)");
+            self.overlay.add_notification(
+                format!("Video ready: {}", output_mp4.display()),
+                15.0,
+                false,
+            );
+        } else {
+            let detail = match &encode_result {
+                Ok(o) if !o.status.success() => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    format!("ffmpeg exited with {}: {}", o.status, stderr.trim())
+                }
+                Ok(_) => "ffmpeg succeeded but output file is missing or empty".to_string(),
+                Err(e) => format!("failed to launch ffmpeg: {}", e),
+            };
+            log::error!("FFmpeg encoding failed: {}", detail);
+            window.set_title("TeekasFigure - Video encoding FAILED");
+            self.overlay
+                .add_notification(format!("Video encoding failed: {}", detail), 15.0, true);
+        }
+    }
+
+    /// Save a manual snapshot of the current canvas.
+    fn snapshot(&mut self) {
+        log::info!("Snapshot save requested (S key)");
+        let filename = io::output::snapshot_filename();
+        match io::output::save_canvas_png(&self.gpu, &self.output_folder, &filename) {
+            Ok(path) => {
+                log::info!("Snapshot saved: {}", path.display());
+                self.overlay
+                    .add_notification(format!("Saved: {}", filename), 3.0, false);
             }
             Err(e) => {
-                log::warn!("Surface texture error: {:?}", e);
-                return;
+                log::error!("Snapshot save failed: {}", e);
+                self.overlay
+                    .add_notification(format!("Save failed: {}", e), 5.0, true);
             }
-        };
-
-        // Create command encoder
-        let mut encoder = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Frame Encoder"),
-        });
-
-        // Blit canvas to surface texture (handles format conversion)
-        let surface_view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.gpu.blit_canvas_to_surface(&mut encoder, &surface_view);
-
-        // Run egui frame
-        let raw_input = self.egui_state.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            self.overlay.render(ctx);
-        });
-
-        // Handle egui platform output (cursor changes, etc.)
-        self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
-
-        // Tessellate egui shapes
-        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-
-        // Update egui textures
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [
-                self.window.inner_size().width,
-                self.window.inner_size().height,
-            ],
-            pixels_per_point: full_output.pixels_per_point,
-        };
-
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.gpu.device, &self.gpu.queue, *id, image_delta);
-        }
-
-        self.egui_renderer.update_buffers(
-            &self.gpu.device,
-            &self.gpu.queue,
-            &mut encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-
-        // Render egui overlay on top of the surface
-        {
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // Keep the canvas content
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            // egui_wgpu 0.30 requires RenderPass<'static> — use forget_lifetime()
-            // to opt into runtime borrow checking instead of compile-time.
-            let mut render_pass = render_pass.forget_lifetime();
-            self.egui_renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
-        }
-
-        // Submit and present
-        self.gpu.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
-
-        // Free egui textures that are no longer needed
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
         }
     }
 }
 
 /// Wrapper struct that implements `ApplicationHandler` for winit 0.30.
-///
-/// This is needed because `ApplicationHandler::resumed` requires `&mut self`,
-/// and we need to own the `App` to pass it into the event loop.
 struct AppHandler {
     app: Option<App>,
 }
 
 impl ApplicationHandler for AppHandler {
-    fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Window is already created before entering the event loop.
-        // Nothing to do here for our use case.
-    }
+    fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {}
 
     fn window_event(
         &mut self,
@@ -639,7 +875,7 @@ impl ApplicationHandler for AppHandler {
             return;
         };
 
-        // Pass events to egui first
+        // Pass events to egui first.
         let egui_response = app.egui_state.on_window_event(&app.window, &event);
         if egui_response.consumed {
             return;
@@ -648,70 +884,49 @@ impl ApplicationHandler for AppHandler {
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("Close requested, shutting down");
-                // Ensure generation is stopped
-                if let Some(app) = self.app.as_mut() {
-                    app.climber.state = GenerationState::Completed;
+                if let Screen::Generation(ref mut g) = app.screen {
+                    g.climber.state = GenerationState::Completed;
                 }
                 event_loop.exit();
             }
 
             WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    logical_key,
-                    state: ElementState::Pressed,
-                    ..
-                },
+                event:
+                    KeyEvent {
+                        logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
                 ..
             } => {
                 match logical_key {
                     Key::Named(NamedKey::Space) => {
-                        // Toggle pause/running
-                        match app.climber.state {
-                            GenerationState::Running => {
-                                app.climber.state = GenerationState::Paused;
-                                app.window.set_title("GPU Image Approximator - Paused");
-                                log::info!("Generation paused");
-                            }
-                            GenerationState::Paused => {
-                                app.climber.state = GenerationState::Running;
-                                app.window.set_title("GPU Image Approximator - Running");
-                                log::info!("Generation resumed");
-                            }
-                            GenerationState::Completed => {
-                                // Cannot unpause when completed
+                        if let Screen::Generation(ref mut g) = app.screen {
+                            match g.climber.state {
+                                GenerationState::Running => {
+                                    g.climber.state = GenerationState::Paused;
+                                    app.window.set_title("TeekasFigure - Paused");
+                                    log::info!("Generation paused");
+                                }
+                                GenerationState::Paused => {
+                                    g.climber.state = GenerationState::Running;
+                                    app.window.set_title("TeekasFigure - Running");
+                                    log::info!("Generation resumed");
+                                }
+                                GenerationState::Completed => {}
                             }
                         }
                     }
                     Key::Character(ref c) if c.as_str() == "s" || c.as_str() == "S" => {
-                        // Snapshot save
-                        log::info!("Snapshot save requested (S key)");
-                        let filename = io::output::snapshot_filename();
-                        match io::output::save_canvas_png(
-                            &app.gpu,
-                            &app.output_folder,
-                            &filename,
-                        ) {
-                            Ok(path) => {
-                                log::info!("Snapshot saved: {}", path.display());
-                                app.overlay.add_notification(
-                                    format!("Saved: {}", filename),
-                                    3.0,
-                                    false,
-                                );
-                            }
-                            Err(e) => {
-                                log::error!("Snapshot save failed: {}", e);
-                                app.overlay.add_notification(
-                                    format!("Save failed: {}", e),
-                                    5.0,
-                                    true,
-                                );
-                            }
+                        if let Screen::Generation(ref mut g) = app.screen {
+                            g.snapshot();
                         }
                     }
                     Key::Named(NamedKey::Escape) => {
                         log::info!("Escape pressed, shutting down");
-                        app.climber.state = GenerationState::Completed;
+                        if let Screen::Generation(ref mut g) = app.screen {
+                            g.climber.state = GenerationState::Completed;
+                        }
                         event_loop.exit();
                     }
                     _ => {}
@@ -719,20 +934,17 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::Resized(new_size) => {
-                if new_size.width > 0 && new_size.height > 0 {
-                    let config = app.gpu.create_surface_config(new_size.width, new_size.height, app.gpu.surface_format);
-                    app.surface.configure(&app.gpu.device, &config);
-                }
+                app.reconfigure_surface(new_size.width, new_size.height);
             }
 
             WindowEvent::RedrawRequested => {
-                // Run generation iterations (skipped if paused/completed)
-                app.run_generation_step();
-
-                // Always render the frame (canvas + overlay)
+                if let Screen::Generation(ref mut g) = app.screen {
+                    // SAFETY: run_generation_step needs &Window while g is borrowed
+                    // from app.screen; window is a separate Arc field.
+                    let window = app.window.clone();
+                    g.run_generation_step(&window);
+                }
                 app.render_frame();
-
-                // Request next frame for continuous 60 FPS rendering
                 app.window.request_redraw();
             }
 
@@ -741,7 +953,6 @@ impl ApplicationHandler for AppHandler {
     }
 
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Request redraw to maintain 60 FPS rendering loop
         if let Some(app) = self.app.as_ref() {
             app.window.request_redraw();
         }
@@ -754,49 +965,35 @@ mod tests {
 
     #[test]
     fn test_target_fits_within_display() {
-        // Target is smaller than 90% of display in both dimensions
         let result = compute_window_size((800, 600), (1920, 1080));
         assert_eq!(result, (800, 600));
     }
 
     #[test]
     fn test_target_exceeds_width() {
-        // Target width exceeds 90% of display width (1920 * 0.9 = 1728)
         let result = compute_window_size((2000, 500), (1920, 1080));
-        // max_w = 1728, scale = 1728/2000 = 0.864
-        // new_w = floor(2000 * 0.864) = 1728, new_h = floor(500 * 0.864) = 432
         assert_eq!(result.0, 1728);
         assert_eq!(result.1, 432);
     }
 
     #[test]
     fn test_target_exceeds_height() {
-        // Target height exceeds 90% of display height (1080 * 0.9 = 972)
         let result = compute_window_size((500, 1200), (1920, 1080));
-        // max_h = 972, scale = 972/1200 = 0.81
-        // new_w = floor(500 * 0.81) = 405, new_h = floor(1200 * 0.81) = 972
         assert_eq!(result.0, 405);
         assert_eq!(result.1, 972);
     }
 
     #[test]
     fn test_target_exceeds_both_dimensions() {
-        // Both dimensions exceed 90% of display
         let result = compute_window_size((3000, 2000), (1920, 1080));
-        // max_w = 1728, max_h = 972
-        // scale_x = 1728/3000 = 0.576, scale_y = 972/2000 = 0.486
-        // scale = 0.486 (height is the limiting factor)
-        // new_w = floor(3000 * 0.486) = 1458, new_h = floor(2000 * 0.486) = 972
         assert_eq!(result.0, 1458);
         assert_eq!(result.1, 972);
-        // Neither dimension exceeds 90% of display
         assert!(result.0 <= 1728);
         assert!(result.1 <= 972);
     }
 
     #[test]
     fn test_exact_90_percent_boundary() {
-        // Target is exactly 90% of display
         let result = compute_window_size((1728, 972), (1920, 1080));
         assert_eq!(result, (1728, 972));
     }
@@ -809,12 +1006,7 @@ mod tests {
 
     #[test]
     fn test_square_target_exceeding_display() {
-        // Square target larger than display
         let result = compute_window_size((2000, 2000), (1920, 1080));
-        // max_w = 1728, max_h = 972
-        // scale_x = 1728/2000 = 0.864, scale_y = 972/2000 = 0.486
-        // scale = 0.486
-        // new_w = floor(2000 * 0.486) = 972, new_h = floor(2000 * 0.486) = 972
         assert_eq!(result.0, 972);
         assert_eq!(result.1, 972);
         assert!(result.0 <= 1728);
@@ -823,15 +1015,9 @@ mod tests {
 
     #[test]
     fn test_aspect_ratio_preserved() {
-        // Verify aspect ratio is preserved within tolerance
         let result = compute_window_size((1600, 900), (1000, 800));
-        // max_w = 900, max_h = 720
-        // scale_x = 900/1600 = 0.5625, scale_y = 720/900 = 0.8
-        // scale = 0.5625
-        // new_w = floor(1600 * 0.5625) = 900, new_h = floor(900 * 0.5625) = 506
         let original_ratio = 1600.0_f64 / 900.0;
         let result_ratio = result.0 as f64 / result.1 as f64;
-        // Within 1 pixel tolerance (as per Property 4 in design)
         assert!((original_ratio - result_ratio).abs() < 0.01);
         assert!(result.0 <= 900);
         assert!(result.1 <= 720);

@@ -367,9 +367,17 @@ impl VideoPipeline {
         let dr = self.rng.gen_range(-0.15_f32..=0.15);
         let new_rotation = (parent.rotation + dr).rem_euclid(std::f32::consts::TAU);
 
-        // Scale: very small change (±10%)
+        // Scale: very small change (±10%) on the X axis.
         let scale_factor = self.rng.gen_range(0.9_f32..=1.1);
         let new_scale = (parent.scale * scale_factor).clamp(settings.scale_min, settings.scale_max);
+        // Y axis: mutated independently when non-uniform scaling is enabled so a
+        // shape can gently stretch/squash across frames; otherwise it tracks X.
+        let new_scale_y = if settings.evolve_non_uniform_scale {
+            let scale_factor_y = self.rng.gen_range(0.9_f32..=1.1);
+            (parent.scale_y * scale_factor_y).clamp(settings.scale_min, settings.scale_max)
+        } else {
+            new_scale
+        };
 
         // Alpha: tiny change (±0.05) or fixed if evolve_opacity is off
         let new_alpha = if settings.evolve_opacity {
@@ -397,7 +405,9 @@ impl VideoPipeline {
             scale: new_scale,
             r, g, b,
             alpha: new_alpha,
-            _padding: [0.0, 0.0, 0.0],
+            scale_y: new_scale_y,
+            use_original_color: parent.use_original_color,
+            _padding: 0.0,
         }
     }
 
@@ -464,8 +474,12 @@ pub fn footprint_area(
     canvas_size: (u32, u32),
     shape_resolution: u32,
 ) -> u32 {
-    let side = (shape.scale * shape_resolution as f32).abs();
-    let area = (side * side).round();
+    // Use both axes so stretched/squashed shapes (non-uniform scaling) report a
+    // realistic footprint; for uniform shapes scale_y == scale so this reduces
+    // to the original side² estimate.
+    let side_x = (shape.scale * shape_resolution as f32).abs();
+    let side_y = (shape.scale_y * shape_resolution as f32).abs();
+    let area = (side_x * side_y).round();
     let canvas_area = (canvas_size.0 as f32) * (canvas_size.1 as f32);
     // Clamp into [1, canvas_area] and convert safely to u32.
     area.clamp(1.0, canvas_area.max(1.0)) as u32
@@ -499,7 +513,9 @@ pub fn lerp_params(a: &CandidateParams, b: &CandidateParams, t: f32) -> Candidat
         g: a.g * inv + b.g * t,
         b: a.b * inv + b.b * t,
         alpha: a.alpha * inv + b.alpha * t,
-        _padding: [0.0, 0.0, 0.0],
+        scale_y: a.scale_y * inv + b.scale_y * t,
+        use_original_color: b.use_original_color,
+        _padding: 0.0,
     }
 }
 
@@ -513,7 +529,9 @@ mod tests {
             x, y, rotation: rot, scale,
             r: 0.0, g: 0.0, b: 0.0,
             alpha,
-            _padding: [0.0, 0.0, 0.0],
+            scale_y: scale,
+            use_original_color: 0.0,
+            _padding: 0.0,
         }
     }
 

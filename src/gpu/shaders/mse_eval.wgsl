@@ -12,8 +12,8 @@ struct CandidateParams {
     g: f32,
     b: f32,
     alpha: f32,
-    _pad0: f32,
-    _pad1: f32,
+    scale_y: f32,
+    use_original_color: f32,
     _pad2: f32,
 }
 
@@ -45,25 +45,25 @@ fn eval_mse(
     // Load candidate parameters
     let candidate = candidates[candidate_idx];
 
-    // Compute bounding box from candidate position and scale
+    // Compute bounding box from candidate position and scale (per axis)
     let shape_res = f32(uniforms.shape_resolution);
-    let shape_size = candidate.scale * shape_res;
-    let half_size = shape_size * 0.5;
+    let shape_size_x = candidate.scale * shape_res;
+    let shape_size_y = candidate.scale_y * shape_res;
+    let half_size_x = shape_size_x * 0.5;
+    let half_size_y = shape_size_y * 0.5;
 
     let center = vec2<f32>(candidate.x, candidate.y);
 
-    // Axis-aligned bounding box (conservative: accounts for rotation by using half_size in both axes)
-    // For a rotated square of half-diagonal = half_size * sqrt(2), but we use half_size * sqrt(2)
-    // to be safe. Actually for a square rotated by any angle, the AABB half-extent is:
-    // half_size * (|cos(r)| + |sin(r)|) per axis, but since we're dealing with a square shape,
-    // the maximum extent is half_size * sqrt(2). We use a simpler conservative bound.
+    // Axis-aligned bounding box for a (possibly non-square) rectangle of half
+    // extents (half_size_x, half_size_y) rotated by `rotation`:
+    //   extent_x = hx*|cos| + hy*|sin|
+    //   extent_y = hx*|sin| + hy*|cos|
     let cos_r = cos(candidate.rotation);
     let sin_r = sin(candidate.rotation);
     let abs_cos = abs(cos_r);
     let abs_sin = abs(sin_r);
-    // For a square with half-side = half_size, rotated AABB half-extents:
-    let extent_x = half_size * (abs_cos + abs_sin);
-    let extent_y = half_size * (abs_sin + abs_cos);
+    let extent_x = half_size_x * abs_cos + half_size_y * abs_sin;
+    let extent_y = half_size_x * abs_sin + half_size_y * abs_cos;
 
     let bb_min_x = max(0, i32(floor(center.x - extent_x)));
     let bb_min_y = max(0, i32(floor(center.y - extent_y)));
@@ -112,9 +112,9 @@ fn eval_mse(
         let shape_local_x = delta_x * inv_cos - delta_y * inv_sin;
         let shape_local_y = delta_x * inv_sin + delta_y * inv_cos;
 
-        // Convert to UV in shape texture space [0, 1]
-        let u = (shape_local_x / shape_size) + 0.5;
-        let v = (shape_local_y / shape_size) + 0.5;
+        // Convert to UV in shape texture space [0, 1] using per-axis sizes
+        let u = (shape_local_x / shape_size_x) + 0.5;
+        let v = (shape_local_y / shape_size_y) + 0.5;
 
         // Load canvas and target pixels (always needed for MSE in bounding box)
         let canvas_pixel = textureLoad(canvas, vec2<i32>(px, py), 0);
@@ -137,12 +137,18 @@ fn eval_mse(
 
             let shape_texel = textureLoad(shapes, vec2<i32>(clamped_x, clamped_y), i32(candidate.shape_index), 0);
 
-            // Shape is grayscale+alpha: luminance in .r, alpha in .a
-            let luminance = shape_texel.r;
+            // Shape is grayscale+alpha (classic) or full color (original mode).
             let shape_alpha = shape_texel.a * candidate.alpha;
 
-            // Tint shape by candidate color
-            let shape_color = vec3<f32>(candidate.r, candidate.g, candidate.b) * luminance;
+            // Color: keep the shape's ORIGINAL texture color, or tint the
+            // candidate color by the grayscale luminance (classic mode).
+            var shape_color: vec3<f32>;
+            if candidate.use_original_color > 0.5 {
+                shape_color = shape_texel.rgb;
+            } else {
+                let luminance = shape_texel.r;
+                shape_color = vec3<f32>(candidate.r, candidate.g, candidate.b) * luminance;
+            }
 
             // Alpha-blend shape over canvas: composited = shape_color * alpha + canvas * (1 - alpha)
             composited = shape_color * shape_alpha + canvas_pixel.rgb * (1.0 - shape_alpha);

@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use crate::ui::Language;
+
 /// A timed notification displayed in the overlay.
 /// Notifications expire after a set duration and are color-coded by severity.
 pub struct Notification {
@@ -28,6 +30,8 @@ pub struct OverlayState {
     pub notifications: Vec<Notification>,
     /// Whether we are in video mode (shows frame number)
     pub is_video: bool,
+    /// UI language for overlay labels.
+    pub language: Language,
 }
 
 impl OverlayState {
@@ -41,6 +45,15 @@ impl OverlayState {
             fps: 0.0,
             notifications: Vec::new(),
             is_video,
+            language: Language::English,
+        }
+    }
+
+    /// Create a new overlay state with an explicit UI language.
+    pub fn with_language(max_shapes: u32, is_video: bool, language: Language) -> Self {
+        Self {
+            language,
+            ..Self::new(max_shapes, is_video)
         }
     }
 
@@ -58,17 +71,18 @@ impl OverlayState {
                     .inner_margin(egui::Margin::same(8.0))
                     .rounding(4.0)
                     .show(ui, |ui| {
+                        let lang = self.language;
                         // Show frame number only in video mode
                         if self.is_video {
                             ui.colored_label(
                                 egui::Color32::WHITE,
-                                format!("Frame: {}", self.frame_number),
+                                format!("{}: {}", lang.t("Frame", "Кадр"), self.frame_number),
                             );
                         }
 
                         ui.colored_label(
                             egui::Color32::WHITE,
-                            format!("Shapes: {} / {}", self.placed_shapes, self.max_shapes),
+                            format!("{}: {} / {}", lang.t("Shapes", "Фигуры"), self.placed_shapes, self.max_shapes),
                         );
 
                         ui.colored_label(
@@ -79,6 +93,14 @@ impl OverlayState {
                         ui.colored_label(
                             egui::Color32::WHITE,
                             format!("FPS: {:.0}", self.fps),
+                        );
+
+                        ui.colored_label(
+                            egui::Color32::from_gray(170),
+                            lang.t(
+                                "Space: pause   S: snapshot   Esc: quit",
+                                "Пробел: пауза   S: снимок   Esc: выход",
+                            ),
                         );
 
                         // Render notifications below stats

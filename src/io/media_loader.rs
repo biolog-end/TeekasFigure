@@ -34,7 +34,7 @@ pub fn get_base_dir() -> PathBuf {
 ///
 /// Returns a list of directory names that were created (useful for notifications).
 pub fn ensure_directories(base: &Path) -> Result<Vec<String>, AppError> {
-    let required_dirs = ["input_media", "input_shapes", "output"];
+    let required_dirs = ["input_media", "input_shapes", "raw_shapes", "output"];
     let mut created = Vec::new();
 
     for dir_name in &required_dirs {
@@ -107,6 +107,120 @@ pub fn load_media(path: &Path) -> Result<MediaType, AppError> {
         Err(AppError::NoMedia {
             path: path.to_path_buf(),
         })
+    }
+}
+
+/// Load a target frame for generation from a media file.
+///
+/// For images this decodes the full image to RGBA8. For videos it extracts the
+/// first frame via FFmpeg (raw RGBA, falling back to a temporary PNG). Returns
+/// `(rgba_pixels, (width, height), is_video)`.
+pub fn load_target(path: &Path) -> Result<(Vec<u8>, (u32, u32), bool), AppError> {
+    match load_media(path)? {
+        MediaType::Image(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Ok((rgba.into_raw(), (w, h), false))
+        }
+        MediaType::Video(video_path) => {
+            let frame = extract_first_video_frame(&video_path)?;
+            Ok((frame.0, frame.1, true))
+        }
+    }
+}
+
+/// Extract the first frame of a video as RGBA8 using FFmpeg/ffprobe.
+fn extract_first_video_frame(video_path: &Path) -> Result<(Vec<u8>, (u32, u32)), AppError> {
+    log::info!("Video detected, extracting first frame via FFmpeg...");
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-i",
+            video_path.to_str().unwrap_or(""),
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-pix_fmt",
+            "rgba",
+            "-vcodec",
+            "rawvideo",
+            "-v",
+            "quiet",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|_| AppError::NoMedia {
+            path: video_path.to_path_buf(),
+        })?;
+
+    if output.stdout.is_empty() {
+        // Fallback: extract a PNG then load it.
+        let temp_frame = std::env::temp_dir().join("gpu_approx_frame0.png");
+        let _ = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                video_path.to_str().unwrap_or(""),
+                "-vframes",
+                "1",
+                "-v",
+                "quiet",
+                temp_frame.to_str().unwrap_or(""),
+            ])
+            .output();
+
+        if temp_frame.exists() {
+            let img = image::open(&temp_frame).map_err(|_| AppError::NoMedia {
+                path: video_path.to_path_buf(),
+            })?;
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            let _ = std::fs::remove_file(&temp_frame);
+            Ok((rgba.into_raw(), (w, h)))
+        } else {
+            Err(AppError::NoMedia {
+                path: video_path.to_path_buf(),
+            })
+        }
+    } else {
+        // Parse raw RGBA frame — need dimensions from ffprobe.
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "quiet",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                video_path.to_str().unwrap_or(""),
+            ])
+            .output()
+            .map_err(|_| AppError::NoMedia {
+                path: video_path.to_path_buf(),
+            })?;
+
+        let dims = String::from_utf8_lossy(&probe.stdout);
+        let parts: Vec<&str> = dims.trim().split(',').collect();
+        if parts.len() < 2 {
+            return Err(AppError::NoMedia {
+                path: video_path.to_path_buf(),
+            });
+        }
+        let w: u32 = parts[0].parse().unwrap_or(640);
+        let h: u32 = parts[1].parse().unwrap_or(480);
+
+        let expected_size = (w * h * 4) as usize;
+        if output.stdout.len() >= expected_size {
+            Ok((output.stdout[..expected_size].to_vec(), (w, h)))
+        } else {
+            Err(AppError::NoMedia {
+                path: video_path.to_path_buf(),
+            })
+        }
     }
 }
 
@@ -183,14 +297,16 @@ mod tests {
     fn test_ensure_directories_creates_missing() {
         let dir = tempfile::tempdir().unwrap();
         let created = ensure_directories(dir.path()).unwrap();
-        assert_eq!(created.len(), 3);
+        assert_eq!(created.len(), 4);
         assert!(created.contains(&"input_media".to_string()));
         assert!(created.contains(&"input_shapes".to_string()));
+        assert!(created.contains(&"raw_shapes".to_string()));
         assert!(created.contains(&"output".to_string()));
 
         // All directories should now exist
         assert!(dir.path().join("input_media").exists());
         assert!(dir.path().join("input_shapes").exists());
+        assert!(dir.path().join("raw_shapes").exists());
         assert!(dir.path().join("output").exists());
     }
 
@@ -199,6 +315,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("input_media")).unwrap();
         fs::create_dir(dir.path().join("input_shapes")).unwrap();
+        fs::create_dir(dir.path().join("raw_shapes")).unwrap();
         fs::create_dir(dir.path().join("output")).unwrap();
 
         let created = ensure_directories(dir.path()).unwrap();

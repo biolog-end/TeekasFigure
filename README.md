@@ -20,7 +20,10 @@ The algorithm evolves a population of shape candidates through tournament select
 - **Advanced Video Processing (Temporal Coherence)** — Shapes aren't just redrawn every frame. They "live" on the canvas, adapting to changes (moving, rotating, scaling), and die only during harsh scene changes to make room for new ones.
 - **Frame Interpolation (Motion Blur effect)** — The algorithm can generate intermediate frames, making the animation incredibly smooth (shapes glide smoothly from one point to another, new shapes softly fade in, and old ones fade out).
 - **Shape Diversity Mode** — Prevents the algorithm from being "lazy" and forces it to use your entire brush arsenal.
-- **Highly Configurable** — Detailed control over evolution, shape life cycles, and the video pipeline via the `settings.toml` file.
+- **Built-in Settings UI** — Configure everything in-app (English/Russian) with smart sliders and toggles, a file picker, and savable presets — no need to hand-edit `settings.toml`.
+- **Progress GIF** — Optionally save an animated GIF of the creation process next to the result image.
+- **Audio-preserving video** — The original soundtrack of a video is kept in the rendered MP4.
+- **Highly Configurable** — Detailed control over evolution, shape life cycles, and the video pipeline via the in-app UI and the `settings.toml` file.
 
 ### Requirements
 
@@ -42,6 +45,19 @@ cargo build --release
 cargo run --release
 ```
 
+### Using the App
+
+When you launch TeekasFigure, it opens on the **Settings screen** (one window, two screens: Settings → Generation):
+
+- **Language** — switch the interface between English and Russian (top-right). Your choice is remembered between runs.
+- **Input file** — pick any image/video from `input_media/` in the dropdown (press *Refresh* after adding new files).
+- **Parameters** — every setting is a slider (you can also click it to type an exact number) or a toggle, grouped into collapsing sections. Irrelevant options grey out automatically — e.g. video options when an image is selected, or diversity sub-options when diversity mode is off.
+- **Presets** — save the current configuration under a name, load it back later, or delete it. Presets are stored as `presets/*.toml`.
+- **Save settings.toml** — writes the current form to `settings.toml` without starting.
+- **▶ Start** — validates the settings, saves them to `settings.toml`, then loads the media + shapes and begins generation.
+
+On the next launch the form loads its initial values straight from `settings.toml`.
+
 ### Folder Structure
 
 ```text
@@ -49,8 +65,9 @@ TeekasFigure/
 ├── input_media/       ← Place your target image (PNG/JPG/BMP) or video (MP4) here
 ├── raw_shapes/        ← Place your raw custom images/brushes here
 ├── input_shapes/      ← Program reads prepared textures from here (do NOT put raw files here!)
-├── output/            ← Finished artworks (PNG, MP4) are saved here
-├── settings.toml      ← Configuration file (auto-created on first run)
+├── output/            ← Finished artworks (PNG, MP4, and optional _process.gif) are saved here
+├── presets/           ← Saved settings presets (created from the in-app UI)
+├── settings.toml      ← Configuration file (auto-created on first run, updated from the UI)
 └── TeekasFigure.exe   ← Compiled application binary
 ```
 
@@ -67,7 +84,7 @@ This script will automatically crop, recolor, and move the ready-to-use optimize
 
 ### Configuration (`settings.toml`)
 
-All parameters are generated in the `settings.toml` file upon the first launch. They are grouped logically for your convenience:
+All parameters are generated in the `settings.toml` file upon the first launch. The easiest way to change them is the in-app Settings screen, but you can also edit the file directly. They are grouped logically for your convenience:
 
 #### ⚙️ Basic Settings
 | Parameter | Description |
@@ -89,11 +106,22 @@ All parameters are generated in the `settings.toml` file upon the first launch. 
 | **`video_recolor`** | `false` (default) — a shape permanently remembers its original color. `true` — shapes continuously recolor themselves to match the new frame (may lead to washed-out details). |
 | **`mutations_per_shape`** | How many local movement/scaling attempts a shape gets to adapt to a new video frame. |
 | **`displacement_weight`** | Penalty for moving a shape too far in a video (forces shapes to "hold" their positions, preventing chaotic jitter). |
+| **`preserve_audio`** | Keep the source video's original audio track in the rendered MP4 (`true`, default). If the source has no audio, this is a no-op. |
+
+#### 🎞️ Progress GIF (image mode)
+| Parameter | Description |
+|-----------|-------------|
+| **`save_progress_gif`** | Save an animated GIF of the creation process next to the result image (`false` by default). Applies to images only — produces `<name>_process.gif` in `output/`. |
+| **`gif_fps`** | Playback speed of the GIF in frames per second (1–50). |
+| **`gif_frames`** | Approximate number of frames captured, spread evenly across the placement process (2–2000). |
+| **`gif_max_width`** | Maximum GIF width in pixels; larger canvases are downscaled to keep the file small (16–2048). |
 
 #### 🧬 Evolution Parameters
 | Parameter | Description |
 |-----------|-------------|
 | **`evolve_opacity`** | Whether to allow the algorithm to pick varying opacity (`true`), or always draw fully opaque strokes (`false`). |
+| **`use_original_colors`** | Use the shapes' original colors (`true`) instead of tinting grayscale brushes (`false`, default). When `true`, shapes are loaded from the **`raw_shapes/`** folder keeping their original RGB colors and are never recolored — only placed/moved/rotated/scaled. Put your colored PNG shapes (ideally with transparency) into `raw_shapes/`. |
+| **`evolve_non_uniform_scale`** | Allow independent X/Y axis scaling (`true`) so shapes can stretch and squash (circle → ellipse, square → rectangle). Default `false` (uniform scaling). |
 | **`num_generations`** | Number of evolutionary generations (tournaments and mutations) to find the perfect shape. |
 | **`min_improvement`** | Minimum MSE improvement threshold required to accept a stroke (negative = improvement). |
 | **`use_min_improvement`** | Whether to enforce the `min_improvement` threshold. **Important: disable this when using `diversity_mode`!** |
@@ -110,9 +138,11 @@ All parameters are generated in the `settings.toml` file upon the first launch. 
 | **`diversity_decay_amount`** | How much penalty is removed from unused shapes per step. |
 
 > **🔥 IMPORTANT FOR DIVERSITY MODE:**
-> The penalty score artificially distorts the mathematical "image improvement" evaluation. Therefore, **when you set `diversity_mode = true`, you MUST set `use_min_improvement = false`**, otherwise the algorithm will reject all shapes due to their penalties and generation will stall.
+> The penalty score artificially distorts the mathematical "image improvement" evaluation. Therefore, **when `diversity_mode = true`, `use_min_improvement` must be `false`**, otherwise the algorithm will reject all shapes due to their penalties and generation will stall. The in-app Settings screen enforces this for you automatically (it disables `use_min_improvement` while diversity mode is on); if you edit `settings.toml` by hand, set it yourself.
 
 ### In-App Controls
+
+Generation starts after you press **▶ Start** on the Settings screen. During generation:
 
 | Key | Action |
 |-----|--------|

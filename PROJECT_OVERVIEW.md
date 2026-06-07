@@ -40,6 +40,7 @@ videofigure/
 ├── prepare_shapes.bat          # обёртка над cargo run --example prepare_shapes
 ├── input_media/                # ← пользователь кладёт PNG/JPG/BMP/MP4
 ├── input_shapes/               # ← готовые 128x128 grayscale+alpha кисти
+├── raw_shapes/                 # ← цветные PNG для режима use_original_colors (оригинальные цвета)
 ├── output/                     # ← результаты (PNG, MP4, snapshot_*)
 ├── examples/
 │   ├── generate_shapes.rs      # генератор тестовых circle.png/square.png
@@ -71,9 +72,14 @@ videofigure/
     │   ├── output.rs                # save_canvas_png, completion_filename, snapshot_filename
     │   ├── shape_preprocessor.rs    # load_and_preprocess (PNG → grayscale+alpha), check_vram_budget
     │   └── video.rs                 # VideoProcessor (FFmpeg decode/encode pipes)
-    └── overlay/
+    ├── overlay/
+    │   ├── mod.rs
+    │   └── state.rs                 # OverlayState (egui), Notification (локализован)
+    └── ui/                          # ← НОВОЕ: экран настроек (egui-форма)
         ├── mod.rs
-        └── state.rs                 # OverlayState (egui), Notification
+        ├── i18n.rs                  # Language (EN/RU), Lang::t(en, ru), load/save_language
+        └── settings_screen.rs       # SettingsScreen: форма, умные слайдеры/тумблеры,
+                                      #   выбор файла, пресеты, язык, кнопка «Пуск»
 ```
 
 ---
@@ -101,25 +107,84 @@ videofigure/
 
 ## 4. Поток выполнения (high-level)
 
+Программа запускается в **одном окне с двумя экранами** (`app::Screen`):
+`Settings` (egui-форма настроек, стартовый режим) и `Generation` (живая
+аппроксимация + оверлей). Тяжёлые GPU-ресурсы создаются не на старте, а **по
+клику «Пуск»**.
+
 ```
 main()
  └─ run()
      1. get_base_dir()                             → путь рядом с .exe
-     2. ensure_directories()                       → создаёт input_media/, input_shapes/, output/
-     3. Settings::load_or_create() + .validate()   → settings.toml
-     4. poll_for_media()                           → ждёт файл в input_media/ (опрос каждые 2 сек)
-     5. load_media()                               → MediaType::Image | MediaType::Video
-        └─ для видео: FFmpeg извлекает первый кадр (raw RGBA или PNG fallback)
-     6. shape_preprocessor::load_and_preprocess()  → Vec<ShapeLayer>
-        + check_vram_budget()
-     7. EventLoop + Window (winit 0.30)
-     8. wgpu::Instance + Surface + GpuContext::new_with_surface()
-     9. egui_ctx + egui_winit::State + egui_wgpu::Renderer
-    10. HillClimber::new(), CandidateGenerator::new(), OverlayState::new()
-    11. App::new(...)
-        └─ если видео: создаёт VideoProcessor (decoder pipe)
-    12. app.run(event_loop) ──── входит в ApplicationHandler цикл
+     2. ensure_directories()                       → input_media/, input_shapes/, raw_shapes/, output/
+     3. Settings::load_or_create() + .validate()   → settings.toml (невалидность НЕ фатальна — чинится в UI)
+     4. ui::i18n::load_language()                  → язык интерфейса (ui_language.txt), дефолт English
+     5. EventLoop + Window (стартовый размер 1000×780, заголовок «Settings»)
+     6. wgpu::Instance + Surface
+     7. GpuContext::init_device_with_surface()     → (device, queue, surface_format), оборачиваются в Arc
+     8. egui_ctx + egui_winit::State + egui_wgpu::Renderer (на общем device)
+     9. App::new(...)                              → экран Screen::Settings(SettingsScreen)
+    10. app.run(event_loop) ──── входит в ApplicationHandler цикл
 ```
+
+### Экран Settings (`ui::settings_screen`)
+
+- Рендерится в `CentralPanel` со `ScrollArea`. Содержит: выбор языка (EN/RU),
+  выбор входного файла из `input_media/` (ComboBox + «Обновить»), управление
+  пресетами (создать/загрузить/удалить), сгруппированные параметры
+  (CollapsingHeader), кнопку «Сохранить settings.toml» и большую кнопку «Пуск».
+- **Слайдеры** (`egui::Slider` с вводом числа вручную) для числовых параметров,
+  **тумблеры** (`Checkbox`) для булевых.
+- Секция **«Progress GIF»** (`save_progress_gif`, `gif_frames`, `gif_fps`,
+  `gif_max_width`) активна только для изображений; секция **«Video»** содержит
+  тумблер `preserve_audio` (сохранять исходный звук).
+- **Умные правила** (серый цвет = неактивно, не влияет): при выключенном
+  `diversity_mode` серы `diversity_penalty_increment`, `diversity_decay_enabled`,
+  `diversity_decay_amount`; при выключенном `diversity_decay_enabled` сер
+  `diversity_decay_amount`; при включённом `diversity_mode` **принудительно
+  выключается** `use_min_improvement` (конфликт) и серы `use_min_improvement`/
+  `min_improvement`; видео-параметры серы, если выбран не `.mp4`; `video_recolor`
+  сер при `use_original_colors`.
+- **Пресеты** хранятся в `presets/<имя>.toml` рядом с .exe. Функции в
+  `settings.rs`: `list_presets`, `load_preset`, `save_preset`, `delete_preset`,
+  `sanitize_preset_name`.
+- **Пуск** валидирует настройки, пишет их в `settings.toml`
+  (`Settings::save`) и возвращает `ScreenAction::Start { media_path, settings,
+  language }`.
+
+### Переход Settings → Generation (`App::begin_generation`)
+
+1. `io::media_loader::load_target()` — грузит цель (картинку или первый кадр
+   видео через FFmpeg/ffprobe).
+2. Ресайз окна под медиа (`compute_window_size`, 90% экрана) + реконфиг surface.
+3. `shape_preprocessor::load_and_preprocess()` (raw_shapes/ при
+   `use_original_colors`) + `check_vram_budget()`.
+4. `GpuContext::new_from_device()` — строит все per-media GPU-ресурсы на **уже
+   существующих** `Arc<Device>`/`Arc<Queue>` (общих с egui).
+5. `HillClimber`, `CandidateGenerator`, `OverlayState::with_language(...)`.
+6. Для видео: чистка `frame_*.png`, инициализация `VideoProcessor` (decoder).
+   Для изображения: если включён `save_progress_gif`, инициализируется захват
+   кадров GIF (порог `gif_next_capture`, шаг `gif_capture_stride = max_shapes /
+   gif_frames`).
+7. `screen = Screen::Generation(...)`. **Ошибки на любом шаге не валят
+   программу** — сообщение выводится в статус-строку экрана Settings.
+
+### Прогресс-GIF (режим изображения)
+
+- В `GenerationContext::maybe_capture_gif_frame` (вызывается в конце
+  `run_generation_step`) при достижении порога `gif_next_capture` считывается
+  холст (`io::output::read_canvas_image`), уменьшается до `gif_max_width`
+  (`downscale_to_width`) и кладётся в `gif_frames`.
+- По завершении (`auto_save_on_completion` → `save_progress_gif_if_enabled`)
+  добавляется финальный кадр и пишется `<stem>_process.gif`
+  (`io::output::save_progress_gif`, бесконечный цикл, задержка по `gif_fps`).
+
+### Звук видео
+
+- `GenerationContext::finalize_video` собирает аргументы FFmpeg в `Vec<String>`.
+  При `preserve_audio = true` исходное видео добавляется вторым входом и его
+  аудиодорожка маппится опционально (`-map 1:a:0?`, `-c:a aac`, `-shortest`),
+  поэтому видео без звука кодируется без ошибок.
 
 ### Внутри event loop (`app.rs::AppHandler`):
 
@@ -142,7 +207,7 @@ main()
 
 | Тип | Описание |
 |-----|----------|
-| `CandidateParams` | `#[repr(C)] bytemuck::Pod`, 48 байт. Поля: `shape_index, x, y, rotation, scale, r, g, b, alpha, _padding[3]`. Загружается в storage- и uniform-буферы. |
+| `CandidateParams` | `#[repr(C)] bytemuck::Pod`, 48 байт. Поля: `shape_index, x, y, rotation, scale, r, g, b, alpha, scale_y, use_original_color, _padding`. `scale_y` — масштаб по локальной оси Y (равен `scale` при равномерном масштабировании; отличается при `evolve_non_uniform_scale`). `use_original_color` — флаг 0.0/1.0: рендерить фигуру в её оригинальных цветах текстуры (1.0) или тинтить по `(r,g,b)` через luminance (0.0). Загружается в storage- и uniform-буферы. |
 | `PlacedShape` | `params: CandidateParams` + `prev_centroid: (f32, f32)` для temporal coherence в `VideoEvolution`. |
 | `GenerationState` | Enum: `Running`, `Paused`, `Completed`. |
 | `StepResult` | Enum: `Accepted(CandidateParams)`, `Rejected`, `Completed`, `Error(String)`. |
@@ -169,19 +234,27 @@ main()
 - `Settings::validate()` — проверяет диапазоны через `validate_u32` / `validate_f32` (NaN отклоняется).
 - ⚠️ В коде есть неиспользуемый `validate_u8` (мёртвый код, без warn-suppress).
 
-**Ключевые параметры** (см. README для полного списка): `batch_size`, `max_shapes`, `mutations_per_frame`, `max_texture_size`, `vram_budget_mb`, `scale_min/max`, `shape_resolution`, `mutations_per_shape`, `displacement_weight`, `scene_change_tolerance` (видео: порог гибели по средней попиксельной дельте; **диапазон −10.0…10.0**, отрицательное значение требует от фигуры активно улучшать свою зону, чтобы выжить), `interpolation_steps` (видео: число интерполированных кадров между ключевыми, 0–20), `video_recolor` (видео: разрешить ли фигурам перекрашиваться под новый кадр; по умолчанию `false` — цвет сохраняется, меняется только геометрия), `target_fps`, `evolve_opacity`, `num_generations`, `min_improvement`, `use_min_improvement`, `max_rejections`, `survival_rate`, `children_per_parent`, `diversity_mode`, `diversity_penalty_increment`, `diversity_decay_enabled`, `diversity_decay_amount`.
+**Ключевые параметры** (см. README для полного списка): `batch_size`, `max_shapes`, `mutations_per_frame`, `max_texture_size`, `vram_budget_mb`, `scale_min/max`, `shape_resolution`, `mutations_per_shape`, `displacement_weight`, `scene_change_tolerance` (видео: порог гибели по средней попиксельной дельте; **диапазон −10.0…10.0**, отрицательное значение требует от фигуры активно улучшать свою зону, чтобы выжить), `interpolation_steps` (видео: число интерполированных кадров между ключевыми, 0–20), `video_recolor` (видео: разрешить ли фигурам перекрашиваться под новый кадр; по умолчанию `false` — цвет сохраняется, меняется только геометрия), `target_fps`, `evolve_opacity`, `use_original_colors` (фигуры берутся из `raw_shapes/` в оригинальных цветах и НЕ перекрашиваются; по умолчанию `false` — фигуры из `input_shapes/` как grayscale-кисти, тинтятся по цвету цели), `evolve_non_uniform_scale` (разрешить независимый масштаб по осям X и Y — фигуры могут растягиваться/сплющиваться; по умолчанию `false` — равномерный масштаб), `num_generations`, `min_improvement`, `use_min_improvement`, `max_rejections`, `survival_rate`, `children_per_parent`, `diversity_mode`, `diversity_penalty_increment`, `diversity_decay_enabled`, `diversity_decay_amount`, `preserve_audio` (видео: сохранять исходную аудиодорожку в MP4; по умолчанию `true`), `save_progress_gif`/`gif_fps`/`gif_frames`/`gif_max_width` (режим изображения: сохранять GIF процесса создания рядом с результатом; по умолчанию `false`).
 
 ### 5.4 `src/main.rs`
 
 - Инициализирует логгер, вызывает `run()`, на ошибке выводит и `exit(1)`.
-- `run()`: см. поток выше.
-- `poll_for_media()` — блокирует поток, опрашивая `input_media/` каждые 2 секунды.
+- `run()`: см. поток выше. Создаёт окно/surface/device/egui и стартует на экране
+  **Settings** (без блокирующего опроса медиа — файл выбирается в UI).
+- ⚠️ Старый `poll_for_media()` удалён (медиа выбирается в SettingsScreen).
 
 ### 5.5 `src/app.rs` — главный цикл
 
 - `compute_window_size(target, display) -> (u32, u32)` — масштабирует под 90% экрана, сохраняет aspect ratio, минимум 1×1. Покрыто 8 unit-тестами.
-- `pub struct App` — владеет `gpu`, `climber`, `generator`, `overlay`, `settings`, `window` (Arc), `surface`, egui-состоянием, `video_pipeline`, `video_decoder`, frame timing.
-- `App::new(...)` — конфигурирует surface (`gpu.create_surface_config`).
+- `enum Screen { Settings(SettingsScreen), Generation(Box<GenerationContext>) }` — активный экран.
+- `pub struct App` — владеет общими ресурсами: `Arc<Device>`, `Arc<Queue>`, `surface`, `surface_format`, `window` (Arc), egui-состоянием, `base_dir`, `output_folder`, `screen`, `frame_times`. **GPU/алгоритм живут не в App, а в `GenerationContext`** (создаётся по «Пуск»).
+- `pub struct GenerationContext` — `gpu`, `climber`, `generator`, `overlay`, `settings`, `source_path`, `output_folder`, `auto_saved`, `video_pipeline`, `video_decoder`, `output_frame_index`. Здесь же методы `run_generation_step`, `auto_save_on_completion`, `handle_video_frame_complete`, `finalize_video`, `snapshot`.
+- `App::new(...)` — конфигурирует surface под стартовый размер, создаёт `SettingsScreen`.
+- `App::begin_generation(media_path, settings, language)` — переход на генерацию (см. поток выше); возвращает `Result<GenerationContext, AppError>`.
+- `App::run(self, event_loop)` — оборачивает в `AppHandler` и вызывает `event_loop.run_app`.
+- `App::render_frame()` — единый рендер для обоих экранов: фон = blit canvas (Generation) или Clear в тёмный (Settings), сверху egui. Action «Пуск» обрабатывается **после** рендера (чтобы при ошибке экран Settings ещё существовал для статус-сообщения).
+- `compute_fps()` — скользящее среднее по последним 60 кадрам.
+- `make_surface_config(w, h, format)` — свободная функция, конфиг surface (заменяет старый `GpuContext::create_surface_config`).
 - `App::run(self, event_loop)` — оборачивает в `AppHandler` и вызывает `event_loop.run_app`.
 - `compute_fps()` — скользящее среднее по последним 60 кадрам.
 - `run_generation_step()` — крутит `climber.step` до `mutations_per_frame` accepted (предохранитель = `mutations_per_frame * 100`); для accepted записывает в `video_pipeline` (если есть).
@@ -214,7 +287,7 @@ main()
 - Свободная функция `select_best(scores)` — поиск минимума с tie-break по индексу.
 - Diversity penalty: к фитнесу прибавляется `shape_penalties[idx]`; при принятии — выбранной фигуре +`diversity_penalty_increment`, остальным `-diversity_decay_amount` (если `diversity_decay_enabled`), clamp ≥ 0.
 - **Переиспользуемые свободные функции** (общие для climber и видео-перерождения, без дублирования логики):
-  - `mutate_candidate(parent, canvas_size, generator, evolve_opacity, rng)` — стандартная (широкая) мутация; `HillClimber::mutate` теперь тонкая обёртка над ней.
+  - `mutate_candidate(parent, canvas_size, generator, evolve_opacity, non_uniform_scale, rng)` — стандартная (широкая) мутация; `HillClimber::mutate` теперь тонкая обёртка над ней. При `non_uniform_scale` ось Y масштабируется независимо от X.
   - `top_n_by_score(candidates, scores, n)` — отбор лучших; `select_top_n` делегирует сюда.
   - `evolve_best_candidate(gpu, generator, settings, placed_shapes, rng) -> Option<(CandidateParams, f32)>` — **полный цикл эволюции** (batch_size случайных → `num_generations` × отбор `survival_rate` + `children_per_parent` детей), возвращает лучшего кандидата и его фитнес. НЕ композитит, НЕ применяет порог `min_improvement`, игнорирует diversity. Используется видео-перерождением, чтобы новая фигура эволюционировала так же, как на первом кадре. `placed_shapes=0` даёт полный диапазон масштаба.
 
@@ -250,8 +323,9 @@ main()
 Поля: `device, queue, canvas, canvas_view, target, target_view, shape_array, shape_array_view, candidate_buffer, fitness_buffer, fitness_staging, uniform_buffer, canvas_size, batch_size, num_shapes, shape_resolution, mse_pipeline, composite_pipeline, mse_bind_group, composite_sampler, composite_uniform_buffer, surface_format, blit_pipeline, blit_bind_group_layout, blit_sampler`.
 
 Два конструктора:
-- `new(target_data, target_size, shapes, settings)` — без surface (headless). Создаёт девайс через `init_device`.
-- `new_with_surface(instance, surface, ...)` — для оконного режима, использует `init_device_with_surface` (адаптер совместимый с surface). Включает первоначальную очистку canvas в тёмно-синий.
+- `new(target_data, target_size, shapes, settings)` — без surface (headless). Создаёт девайс через `init_device`. (Сейчас не используется приложением — legacy/тесты.)
+- `new_with_surface(instance, surface, ...)` — создаёт device через `init_device_with_surface` и делегирует в `new_from_device`.
+- `new_from_device(Arc<Device>, Arc<Queue>, surface_format, target_data, target_size, shapes, settings)` — **основной путь**: строит per-media GPU-ресурсы на уже существующих device/queue (общих с egui). Используется `App::begin_generation` по клику «Пуск». `init_device_with_surface` теперь `pub` (вызывается из `main`). `device`/`queue` хранятся как `Arc<...>` (метод-вызовы работают через `Deref`).
 
 Методы:
 - `dpatch_mse_evaluation(candidates: &[CandidateParams])` — `write_buffer(candidate_buffer)` + `write_buffer(uniform_buffer)` + compute pass с `dispatch_workgroups(num_candidates, 1, 1)`. Workgroup size = 256.
@@ -301,8 +375,12 @@ main()
 
 #### `output.rs`
 - `completion_filename(source) -> "<stem>_result.png"`.
+- `process_gif_filename(source) -> "<stem>_process.gif"`.
 - `snapshot_filename() -> "snapshot_YYYYMMDD_HHMMSS.png"` (chrono).
-- `save_canvas_png(gpu, output_folder, filename)` — `copy_texture_to_buffer` со 256-byte row alignment, `map_async`, удаление паддинга, `image::RgbaImage::from_raw + save`.
+- `read_canvas_image(gpu) -> RgbaImage` — readback холста с обработкой 256-byte выравнивания (общий хелпер для PNG и GIF).
+- `save_canvas_png(gpu, output_folder, filename)` — `read_canvas_image` + `image::save`.
+- `save_progress_gif(frames, folder, filename, fps)` — кодирует кадры в зацикленный GIF (`image::codecs::gif::GifEncoder`, speed 15, `Repeat::Infinite`, задержка `1000/fps` мс).
+- `downscale_to_width(img, max_width)` — уменьшение по ширине с сохранением пропорций (`imageops::resize`, Triangle).
 - `clean_frame_sequence(output_folder) -> usize` — удаляет остаточные `frame_<цифры>.png` от предыдущего прогона (вызывается в `main.rs` ДО старта видео). Без этого FFmpeg по маске `frame_%05d.png` подхватывал бы «хвост» от более длинного прошлого видео. `*_result.*` и `snapshot_*.png` не трогаются. Хелпер `is_frame_sequence_name` распознаёт паттерн.
 - `align_to(value, alignment)` — power-of-2 align up.
 
@@ -323,9 +401,25 @@ main()
 
 ### 5.9 `src/overlay/state.rs`
 - `Notification { message, expires_at: Instant, is_error: bool }`.
-- `OverlayState { frame_number, placed_shapes, max_shapes, current_mse, fps, notifications, is_video }`.
-- `render(ctx)` — `egui::Area("overlay_stats")` в (10,10), полупрозрачный фон, текст со статистикой; уведомления красным/жёлтым.
+- `OverlayState { frame_number, placed_shapes, max_shapes, current_mse, fps, notifications, is_video, language }`.
+- `new(max_shapes, is_video)` (язык English) и `with_language(max_shapes, is_video, language)`.
+- `render(ctx)` — `egui::Area("overlay_stats")` в (10,10), полупрозрачный фон, **локализованные** подписи (Frame/Кадр, Shapes/Фигуры, подсказка по клавишам); уведомления красным/жёлтым.
 - `add_notification` — лимит 5 (старые удаляются), `cleanup_notifications` — снимает истёкшие.
+
+### 5.10 `src/ui/` — экран настроек
+
+#### `i18n.rs`
+- `enum Language { English, Russian }` (дефолт English), `Language::t(en, ru) -> &str` — выбор варианта строки прямо по месту использования (без таблицы ключей).
+- `load_language(base_dir)` / `save_language(base_dir, lang)` — персист в `ui_language.txt` рядом с .exe (`en`/`ru`).
+
+#### `settings_screen.rs`
+- `enum ScreenAction { None, Start { media_path, settings, language } }`.
+- `struct SettingsScreen` — рабочая копия `Settings`, язык, `base_dir`/`settings_path`/`presets_dir`/`media_dir`, список медиа-файлов + выбор, список пресетов + выбор, поле имени нового пресета, статус-строка.
+- `render(ctx) -> ScreenAction` — каждый кадр: `enforce_smart_rules()` (конфликты), затем header (язык), media_section (выбор файла), presets_section, parameters (CollapsingHeader-группы со слайдерами/тумблерами), footer (Сохранить/Пуск + статус).
+- Хелперы `slider_u32`/`slider_f32`/`toggle` через `ui.add_enabled(enabled, ...)` — отключённые виджеты серые. Слайдеры допускают ручной ввод числа.
+- `MEDIA_EXTENSIONS = png/jpg/jpeg/bmp/mp4`; видео-секция активна только если выбран `.mp4`.
+
+⚠️ `Settings::save(path)` пишет TOML через `toml::to_string_pretty` (без комментариев, все поля). Управление пресетами — свободные функции в `settings.rs` (`list_presets`/`load_preset`/`save_preset`/`delete_preset`/`sanitize_preset_name`), файлы `presets/<имя>.toml`.
 
 ---
 
@@ -339,8 +433,10 @@ main()
 - **`shape_resolution` нельзя менять без подготовки шейпов** — `prepare_shapes.rs` хардкодит 128.
 - **Видео-режим в `app.rs` пересоздаёт `CandidateGenerator` на каждом новом кадре** — берёт новые пиксели для color sampling. Для кадров > 0 `HillClimber` НЕ дозаполняет популяцию (ставится `placed_shapes = max_shapes` → мгновенный `Completed` → переход к следующему кадру). Вся работа по кадру делается в `VideoPipeline::adapt_to_new_frame` (адаптация геометрии + перерождение мёртвых). Популяция заморожена с первого кадра.
 - **Сборка: пользователь запускает release.** Изменения видны только после `cargo build --release` (debug-сборка не обновляет `target/release`). При проверке правок видео всегда собирать `--release`.
-- **`settings.toml` не дополняется автоматически.** Новые поля пишутся в файл только при его отсутствии (через `DEFAULT_SETTINGS_TOML`). Если файл уже есть, новое поле берётся из serde-default (`#[serde(default)]`), но в самом файле не появится — при добавлении параметра либо сообщить пользователю, либо предложить удалить `settings.toml` для пересоздания.
-- **Размер кандидата = 48 байт** жёстко (24 поля как f32 + 3 padding + shape_index u32). Любое изменение требует синхронной правки `CandidateParams` (Rust) + `composite.wgsl` + `mse_eval.wgsl` + размера в `candidate_buffer`.
+- **`settings.toml` теперь перезаписывается из UI.** При клике «Пуск» (и по кнопке «Сохранить settings.toml») экран Settings пишет файл через `Settings::save` — все поля присутствуют, но **комментарии теряются** (плоская сериализация). `DEFAULT_SETTINGS_TOML` (с комментариями) пишется только при первом создании отсутствующего файла. Частичный/устаревший файл по-прежнему дополняется serde-дефолтами при чтении.
+- **Размер кандидата = 48 байт** жёстко (1 `u32` + 11 `f32` = 48). Поля: `shape_index, x, y, rotation, scale, r, g, b, alpha, scale_y, use_original_color, _padding`. Любое изменение требует синхронной правки `CandidateParams` (Rust) + `composite.wgsl` + `mse_eval.wgsl` + размера в `candidate_buffer`. `scale_y` и `use_original_color` ранее были padding-полями — переиспользованы без роста структуры.
+- **`use_original_colors`**: фигуры грузятся из `raw_shapes/` (а не `input_shapes/`) с сохранением RGB (`shape_preprocessor::convert_to_color_alpha`); шейдеры рендерят оригинальный цвет фигуры вместо тинта `(r,g,b)×luminance`. Если у raw-PNG нет альфы — она выводится из luminance (силуэт). `ensure_directories` теперь создаёт и `raw_shapes/`.
+- **`evolve_non_uniform_scale`**: генератор и мутации (climber + видео) задают/меняют `scale_y` независимо от `scale`; шейдеры используют `shape_size_x = scale×res`, `shape_size_y = scale_y×res`, AABB считается для повёрнутого прямоугольника. `footprint_area` учитывает обе оси.
 
 ---
 

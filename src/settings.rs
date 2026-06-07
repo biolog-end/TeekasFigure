@@ -61,6 +61,20 @@ target_fps = 12
 # Whether shapes can have variable opacity (true) or always fully opaque (false)
 evolve_opacity = true
 
+# Use the shapes' ORIGINAL colors instead of tinting them (true/false). Default false.
+# When false (default), shapes are loaded from input_shapes/ as grayscale brushes and
+# tinted with colors sampled from the target image (classic behaviour). When true,
+# shapes are loaded from raw_shapes/ KEEPING their original RGB colors — the algorithm
+# never recolors them, it only places/moves/rotates/scales them as-is. Put your colored
+# PNG shapes (ideally with transparency) into a raw_shapes/ folder next to the executable.
+use_original_colors = false
+
+# Allow NON-UNIFORM (per-axis) scaling of shapes (true/false). Default false.
+# When false (default), a shape's width and height scale together (uniform zoom).
+# When true, a shape can scale independently along its X and Y axes, so it can stretch
+# and squash (e.g. a circle can become an ellipse, a square a rectangle) during evolution.
+evolve_non_uniform_scale = false
+
 # Whether existing shapes RE-COLOR themselves to match the new frame during video
 # adaptation (true) or keep their original color and only move/rotate/scale (false).
 # Default is false: a shape placed on frame 1 keeps its color for the whole video and
@@ -68,6 +82,28 @@ evolve_opacity = true
 # resample the new frame's colors as they adapt. (Reborn shapes filling gaps always
 # take a fresh color regardless, since they have no previous color.)
 video_recolor = false
+
+# Preserve the original audio track of the source video in the rendered MP4
+# (true/false). Default true. If the source has no audio this is a no-op.
+preserve_audio = true
+
+# --- Progress GIF (image mode only) ---
+
+# Save an animated GIF of the creation process next to the result image (true/false).
+# Default false. Only applies when the input is an image: as shapes are placed, the
+# canvas is periodically captured and assembled into <name>_process.gif.
+save_progress_gif = false
+
+# Playback speed of the progress GIF in frames per second (1–50).
+gif_fps = 20
+
+# Approximate number of frames captured for the progress GIF (2–2000). Captures are
+# spread evenly across the shape-placement process.
+gif_frames = 120
+
+# Maximum width (px) of the progress GIF; larger canvases are downscaled to keep the
+# file small (16–2048). Height scales to preserve aspect ratio.
+gif_max_width = 480
 
 # --- Evolution Algorithm Parameters ---
 
@@ -140,9 +176,25 @@ pub struct Settings {
     pub target_fps: u32,
     /// Whether shapes can have variable opacity (true) or are always fully opaque (false).
     pub evolve_opacity: bool,
+    /// Use the shapes' original RGB colors (true) instead of tinting grayscale brushes (false).
+    /// When true, shapes are loaded from `raw_shapes/` keeping their colors and are never recolored.
+    pub use_original_colors: bool,
+    /// Allow non-uniform (per-axis) scaling so shapes can stretch/squash along a single axis (true)
+    /// or only scale uniformly (false).
+    pub evolve_non_uniform_scale: bool,
     /// Whether existing shapes re-color to the new frame during video adaptation (true)
     /// or keep their original color and only adapt geometry (false). Default false.
     pub video_recolor: bool,
+    /// Preserve the source video's audio track in the rendered MP4 (true) if present.
+    pub preserve_audio: bool,
+    /// Save an animated GIF of the creation process (image mode only).
+    pub save_progress_gif: bool,
+    /// Progress GIF playback speed in frames per second (1–50).
+    pub gif_fps: u32,
+    /// Approximate number of frames captured for the progress GIF (2–2000).
+    pub gif_frames: u32,
+    /// Maximum width (px) of the progress GIF; larger canvases are downscaled (16–2048).
+    pub gif_max_width: u32,
     /// Number of evolutionary generations per shape placement (1–20).
     pub num_generations: u32,
     /// Minimum improvement threshold (negative). Shape rejected if best delta > this.
@@ -182,7 +234,14 @@ impl Default for Settings {
             interpolation_steps: 2,
             target_fps: 12,
             evolve_opacity: true,
+            use_original_colors: false,
+            evolve_non_uniform_scale: false,
             video_recolor: false,
+            preserve_audio: true,
+            save_progress_gif: false,
+            gif_fps: 20,
+            gif_frames: 120,
+            gif_max_width: 480,
             num_generations: 4,
             min_improvement: -0.5,
             use_min_improvement: true,
@@ -247,6 +306,26 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Serialize these settings to a TOML file, overwriting any existing file.
+    ///
+    /// Unlike the documented `DEFAULT_SETTINGS_TOML`, this writes a plain
+    /// serialized form (all fields present, no comments). Used by the Settings
+    /// UI so that changing values in the form persists to `settings.toml`.
+    pub fn save(&self, path: &Path) -> Result<(), AppError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| AppError::SaveFailed {
+                reason: format!("failed to create settings directory: {}", e),
+            })?;
+        }
+        let toml = toml::to_string_pretty(self).map_err(|e| AppError::SaveFailed {
+            reason: format!("failed to serialize settings: {}", e),
+        })?;
+        fs::write(path, toml).map_err(|e| AppError::SaveFailed {
+            reason: format!("failed to write settings file: {}", e),
+        })?;
+        Ok(())
+    }
+
     /// Validate all parameter ranges. Returns `Ok(())` if all values are within bounds,
     /// or the first `AppError::SettingsValidation` encountered.
     pub fn validate(&self) -> Result<(), AppError> {
@@ -263,6 +342,9 @@ impl Settings {
         self.validate_f32("scene_change_tolerance", self.scene_change_tolerance, -10.0, 10.0)?;
         self.validate_u32("interpolation_steps", self.interpolation_steps, 0, 20)?;
         self.validate_u32("target_fps", self.target_fps, 1, 60)?;
+        self.validate_u32("gif_fps", self.gif_fps, 1, 50)?;
+        self.validate_u32("gif_frames", self.gif_frames, 2, 2000)?;
+        self.validate_u32("gif_max_width", self.gif_max_width, 16, 2048)?;
         self.validate_u32("num_generations", self.num_generations, 1, 20)?;
         self.validate_f32("min_improvement", self.min_improvement, -10000.0, 0.0)?;
         self.validate_u32("max_rejections", self.max_rejections, 1, 500)?;
@@ -305,6 +387,84 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Sanitize a user-supplied preset name into a safe file stem.
+/// Keeps alphanumerics, spaces, dashes and underscores; trims the result.
+pub fn sanitize_preset_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    cleaned.trim().to_string()
+}
+
+/// List the names (file stems) of all settings presets stored as `*.toml`
+/// files in `dir`, sorted case-insensitively. Returns an empty list if the
+/// directory does not exist.
+pub fn list_presets(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("toml"))
+                        .unwrap_or(false)
+            })
+            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort_by_key(|n| n.to_lowercase());
+    names
+}
+
+/// Load a named preset from `dir`.
+pub fn load_preset(dir: &Path, name: &str) -> Result<Settings, AppError> {
+    let path = dir.join(format!("{}.toml", name));
+    Settings::load_or_create(&path).and_then(|s| {
+        // load_or_create would silently create a default file for a missing
+        // preset; guard against that by validating existence first.
+        if path.exists() {
+            Ok(s)
+        } else {
+            Err(AppError::SettingsParse {
+                location: path.display().to_string(),
+                message: "preset not found".to_string(),
+            })
+        }
+    })
+}
+
+/// Save `settings` as a named preset inside `dir` (created if missing).
+pub fn save_preset(dir: &Path, name: &str, settings: &Settings) -> Result<(), AppError> {
+    let name = sanitize_preset_name(name);
+    if name.is_empty() {
+        return Err(AppError::SaveFailed {
+            reason: "preset name is empty".to_string(),
+        });
+    }
+    fs::create_dir_all(dir).map_err(|e| AppError::SaveFailed {
+        reason: format!("failed to create presets directory: {}", e),
+    })?;
+    settings.save(&dir.join(format!("{}.toml", name)))
+}
+
+/// Delete a named preset from `dir`.
+pub fn delete_preset(dir: &Path, name: &str) -> Result<(), AppError> {
+    let path = dir.join(format!("{}.toml", name));
+    fs::remove_file(&path).map_err(|e| AppError::SaveFailed {
+        reason: format!("failed to delete preset '{}': {}", name, e),
+    })
 }
 
 #[cfg(test)]

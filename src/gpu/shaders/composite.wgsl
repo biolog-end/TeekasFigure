@@ -12,8 +12,8 @@ struct CandidateParams {
     g: f32,
     b: f32,
     alpha: f32,
-    _pad0: f32,
-    _pad1: f32,
+    scale_y: f32,
+    use_original_color: f32,
     _pad2: f32,
 }
 
@@ -70,10 +70,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Candidate center in pixel coordinates
     let center = vec2<f32>(candidate.x, candidate.y);
 
-    // Shape size in pixels (scale * shape_resolution)
+    // Shape size in pixels (scale * shape_resolution) per axis. scale_y lets the
+    // shape stretch/squash independently along its local Y axis.
     let shape_res = f32(textureDimensions(shapes).x);
-    let shape_size = candidate.scale * shape_res;
-    let half_size = shape_size * 0.5;
+    let shape_size_x = candidate.scale * shape_res;
+    let shape_size_y = candidate.scale_y * shape_res;
 
     // Vector from candidate center to this pixel
     let delta = pixel_pos - center;
@@ -84,10 +85,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let local_x = delta.x * cos_r - delta.y * sin_r;
     let local_y = delta.x * sin_r + delta.y * cos_r;
 
-    // Convert to UV in shape texture space [0, 1]
+    // Convert to UV in shape texture space [0, 1] using per-axis sizes
     let shape_uv = vec2<f32>(
-        (local_x / shape_size) + 0.5,
-        (local_y / shape_size) + 0.5,
+        (local_x / shape_size_x) + 0.5,
+        (local_y / shape_size_y) + 0.5,
     );
 
     // If outside the shape bounds, output fully transparent (no contribution)
@@ -98,14 +99,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Sample from the shape texture array at the candidate's shape_index
     let shape_color = textureSample(shapes, shape_sampler, shape_uv, candidate.shape_index);
 
-    // The shape texture is grayscale+alpha: use the alpha from the shape texture
-    // multiplied by the candidate's alpha as the final alpha.
-    // Tint with the candidate's color (r, g, b).
+    // Final alpha = shape's alpha × candidate's opacity.
     let final_alpha = shape_color.a * candidate.alpha;
 
-    // Output: candidate color tinted by shape luminance, with combined alpha
-    let luminance = shape_color.r; // grayscale, so r=g=b
-    let out_color = vec3<f32>(candidate.r, candidate.g, candidate.b) * luminance;
+    // Color: either keep the shape's ORIGINAL texture color (use_original_color)
+    // or tint the candidate's (r, g, b) by the grayscale luminance (classic mode).
+    var out_color: vec3<f32>;
+    if (candidate.use_original_color > 0.5) {
+        out_color = shape_color.rgb;
+    } else {
+        let luminance = shape_color.r; // grayscale, so r=g=b
+        out_color = vec3<f32>(candidate.r, candidate.g, candidate.b) * luminance;
+    }
 
     return vec4<f32>(out_color, final_alpha);
 }

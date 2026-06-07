@@ -140,7 +140,7 @@ impl HillClimber {
 
                 // Create mutated children
                 for _ in 0..settings.children_per_parent {
-                    let child = self.mutate(parent, gpu.canvas_size, generator, settings.evolve_opacity);
+                    let child = self.mutate(parent, gpu.canvas_size, generator, settings.evolve_opacity, settings.evolve_non_uniform_scale);
                     next_gen.push(child);
                 }
             }
@@ -216,8 +216,9 @@ impl HillClimber {
         canvas_size: (u32, u32),
         generator: &mut CandidateGenerator,
         evolve_opacity: bool,
+        non_uniform_scale: bool,
     ) -> CandidateParams {
-        mutate_candidate(parent, canvas_size, generator, evolve_opacity, &mut self.rng)
+        mutate_candidate(parent, canvas_size, generator, evolve_opacity, non_uniform_scale, &mut self.rng)
     }
 }
 
@@ -231,6 +232,7 @@ pub fn mutate_candidate(
     canvas_size: (u32, u32),
     generator: &CandidateGenerator,
     evolve_opacity: bool,
+    non_uniform_scale: bool,
     rng: &mut SmallRng,
 ) -> CandidateParams {
     let (cw, ch) = canvas_size;
@@ -245,9 +247,17 @@ pub fn mutate_candidate(
     let dr = rng.gen_range(-0.5_f32..=0.5);
     let new_rotation = (parent.rotation + dr).rem_euclid(std::f32::consts::TAU);
 
-    // Scale: ±30% (multiplicative)
+    // Scale: ±30% (multiplicative) on the X axis.
     let scale_factor = rng.gen_range(0.7_f32..=1.3);
     let new_scale = (parent.scale * scale_factor).clamp(0.02, 20.0);
+    // Y axis: mutated independently when non-uniform scaling is on (lets the
+    // shape stretch/squash); otherwise it follows the X scale (uniform).
+    let new_scale_y = if non_uniform_scale {
+        let scale_factor_y = rng.gen_range(0.7_f32..=1.3);
+        (parent.scale_y * scale_factor_y).clamp(0.02, 20.0)
+    } else {
+        new_scale
+    };
 
     // Alpha: ±0.2 (or fixed at 1.0 if opacity evolution is disabled)
     let new_alpha = if evolve_opacity {
@@ -257,7 +267,8 @@ pub fn mutate_candidate(
         1.0
     };
 
-    // Color: re-sample from target at new position
+    // Color: re-sample from target at new position (ignored at render time when
+    // the shape uses its original colors).
     let (r, g, b) = generator.sample_color_at(new_x as u32, new_y as u32);
 
     CandidateParams {
@@ -270,7 +281,9 @@ pub fn mutate_candidate(
         g,
         b,
         alpha: new_alpha,
-        _padding: [0.0, 0.0, 0.0],
+        scale_y: new_scale_y,
+        use_original_color: parent.use_original_color,
+        _padding: 0.0,
     }
 }
 
@@ -353,6 +366,7 @@ pub fn evolve_best_candidate(
                     gpu.canvas_size,
                     generator,
                     settings.evolve_opacity,
+                    settings.evolve_non_uniform_scale,
                     rng,
                 ));
             }

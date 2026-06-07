@@ -4,12 +4,14 @@ use crate::error::AppError;
 use crate::settings::Settings;
 use crate::types::{CandidateParams, EvalUniforms, ShapeLayer};
 
+use std::sync::Arc;
+
 use super::pipelines::{CompositePipeline, MsePipeline};
 
 /// Holds all GPU resources needed for the image approximation pipeline.
 pub struct GpuContext {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
     pub canvas: wgpu::Texture,
     pub canvas_view: wgpu::TextureView,
     pub target: wgpu::Texture,
@@ -58,6 +60,8 @@ impl GpuContext {
         settings: &Settings,
     ) -> Result<Self, AppError> {
         let (device, queue) = pollster::block_on(Self::init_device())?;
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
 
         let (width, height) = target_size;
         let num_shapes = shapes.len() as u32;
@@ -561,7 +565,33 @@ impl GpuContext {
     ) -> Result<Self, AppError> {
         let (device, queue, surface_format) =
             pollster::block_on(Self::init_device_with_surface(instance, surface))?;
+        Self::new_from_device(
+            Arc::new(device),
+            Arc::new(queue),
+            surface_format,
+            target_data,
+            target_size,
+            shapes,
+            settings,
+        )
+    }
 
+    /// Build all image-specific GPU resources on top of an already-created
+    /// device/queue (typically shared with the egui renderer).
+    ///
+    /// This allows the window, surface and egui to be created up-front for the
+    /// Settings screen, deferring the heavy per-media GPU allocation until the
+    /// user presses "Start". `Arc<wgpu::Device>`/`Arc<wgpu::Queue>` are cheap to
+    /// clone, so the same device keeps backing the egui renderer.
+    pub fn new_from_device(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        surface_format: wgpu::TextureFormat,
+        target_data: &[u8],
+        target_size: (u32, u32),
+        shapes: &[ShapeLayer],
+        settings: &Settings,
+    ) -> Result<Self, AppError> {
         let (width, height) = target_size;
         let num_shapes = shapes.len() as u32;
         let shape_resolution = settings.shape_resolution;
@@ -917,7 +947,7 @@ impl GpuContext {
 
     /// Request a WGPU adapter compatible with the given surface, then create a device.
     /// Explicitly enumerates adapters and prefers discrete GPUs to avoid using integrated graphics.
-    async fn init_device_with_surface(
+    pub async fn init_device_with_surface(
         instance: &wgpu::Instance,
         surface: &wgpu::Surface<'_>,
     ) -> Result<(wgpu::Device, wgpu::Queue, wgpu::TextureFormat), AppError> {

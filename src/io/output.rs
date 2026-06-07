@@ -27,33 +27,22 @@ pub fn snapshot_filename() -> String {
     format!("snapshot_{}.png", now.format("%Y%m%d_%H%M%S"))
 }
 
-/// Save the current canvas as a PNG file.
-///
-/// Reads the canvas texture from GPU to CPU, encodes as PNG, and writes to disk.
-/// Creates the output folder if it doesn't exist. Overwrites existing files.
-///
-/// # Arguments
-/// * `gpu` - The GPU context holding the canvas texture
-/// * `output_folder` - Path to the output directory
-/// * `filename` - The filename to save as (e.g., "photo_result.png")
-///
-/// # Returns
-/// The full path to the saved file on success, or `AppError::SaveFailed` on failure.
-pub fn save_canvas_png(
-    gpu: &GpuContext,
-    output_folder: &Path,
-    filename: &str,
-) -> Result<PathBuf, AppError> {
-    // Ensure output folder exists (create if missing, including parents)
-    std::fs::create_dir_all(output_folder).map_err(|e| AppError::SaveFailed {
-        reason: format!("Failed to create output folder '{}': {}", output_folder.display(), e),
-    })?;
+/// Generate the progress-GIF filename: `{source_stem}_process.gif`
+pub fn process_gif_filename(source_path: &Path) -> String {
+    let stem = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    format!("{}_process.gif", stem)
+}
 
-    let output_path = output_folder.join(filename);
-
-    // Read canvas texture to CPU
+/// Read the current canvas texture from the GPU into an RGBA image (CPU-side).
+///
+/// Handles the 256-byte row-alignment that wgpu requires for texture→buffer
+/// copies and strips the padding. Shared by [`save_canvas_png`] and the
+/// progress-GIF capture path.
+pub fn read_canvas_image(gpu: &GpuContext) -> Result<image::RgbaImage, AppError> {
     let (width, height) = gpu.canvas_size;
-    // wgpu requires rows to be aligned to 256 bytes (COPY_BYTES_PER_ROW_ALIGNMENT)
     let unpadded_bytes_per_row = width * 4;
     let padded_bytes_per_row = align_to(unpadded_bytes_per_row, 256);
     let buffer_size = (padded_bytes_per_row * height) as u64;
@@ -65,7 +54,6 @@ pub fn save_canvas_png(
         mapped_at_creation: false,
     });
 
-    // Copy canvas texture to staging buffer
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -94,7 +82,6 @@ pub fn save_canvas_png(
     );
     gpu.queue.submit(std::iter::once(encoder.finish()));
 
-    // Map and read the buffer
     let buffer_slice = staging_buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -111,8 +98,6 @@ pub fn save_canvas_png(
         })?;
 
     let data = buffer_slice.get_mapped_range();
-
-    // Remove row padding and create a contiguous pixel buffer
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for row in 0..height {
         let start = (row * padded_bytes_per_row) as usize;
@@ -122,18 +107,101 @@ pub fn save_canvas_png(
     drop(data);
     staging_buffer.unmap();
 
-    // Encode as PNG and save
-    let img = image::RgbaImage::from_raw(width, height, pixels).ok_or_else(|| {
-        AppError::SaveFailed {
-            reason: "Failed to create image from canvas pixel data".to_string(),
-        }
+    image::RgbaImage::from_raw(width, height, pixels).ok_or_else(|| AppError::SaveFailed {
+        reason: "Failed to create image from canvas pixel data".to_string(),
+    })
+}
+
+/// Save the current canvas as a PNG file.
+///
+/// Reads the canvas texture from GPU to CPU, encodes as PNG, and writes to disk.
+/// Creates the output folder if it doesn't exist. Overwrites existing files.
+///
+/// # Arguments
+/// * `gpu` - The GPU context holding the canvas texture
+/// * `output_folder` - Path to the output directory
+/// * `filename` - The filename to save as (e.g., "photo_result.png")
+///
+/// # Returns
+/// The full path to the saved file on success, or `AppError::SaveFailed` on failure.
+pub fn save_canvas_png(
+    gpu: &GpuContext,
+    output_folder: &Path,
+    filename: &str,
+) -> Result<PathBuf, AppError> {
+    // Ensure output folder exists (create if missing, including parents)
+    std::fs::create_dir_all(output_folder).map_err(|e| AppError::SaveFailed {
+        reason: format!("Failed to create output folder '{}': {}", output_folder.display(), e),
     })?;
+
+    let output_path = output_folder.join(filename);
+    let img = read_canvas_image(gpu)?;
 
     img.save(&output_path).map_err(|e| AppError::SaveFailed {
         reason: format!("Failed to save PNG to '{}': {}", output_path.display(), e),
     })?;
 
     Ok(output_path)
+}
+
+/// Encode a sequence of frames as an animated, infinitely-looping GIF.
+///
+/// All frames should share the same dimensions (the capture path downscales
+/// them to a common width). `fps` controls playback speed (frame delay).
+pub fn save_progress_gif(
+    frames: &[image::RgbaImage],
+    output_folder: &Path,
+    filename: &str,
+    fps: u32,
+) -> Result<PathBuf, AppError> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame};
+
+    if frames.is_empty() {
+        return Err(AppError::SaveFailed {
+            reason: "no frames captured for progress GIF".to_string(),
+        });
+    }
+
+    std::fs::create_dir_all(output_folder).map_err(|e| AppError::SaveFailed {
+        reason: format!("Failed to create output folder '{}': {}", output_folder.display(), e),
+    })?;
+    let output_path = output_folder.join(filename);
+
+    let file = std::fs::File::create(&output_path).map_err(|e| AppError::SaveFailed {
+        reason: format!("Failed to create GIF '{}': {}", output_path.display(), e),
+    })?;
+
+    // Speed 1 (best quality) .. 30 (fastest). 15 balances size/quality/time.
+    let mut encoder = GifEncoder::new_with_speed(file, 15);
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .map_err(|e| AppError::SaveFailed {
+            reason: format!("Failed to set GIF repeat: {}", e),
+        })?;
+
+    let fps = fps.max(1);
+    let delay = Delay::from_numer_denom_ms(1000, fps);
+    for img in frames {
+        let frame = Frame::from_parts(img.clone(), 0, 0, delay);
+        encoder.encode_frame(frame).map_err(|e| AppError::SaveFailed {
+            reason: format!("Failed to encode GIF frame: {}", e),
+        })?;
+    }
+    // Drop the encoder to flush/finish the file.
+    drop(encoder);
+
+    Ok(output_path)
+}
+
+/// Downscale an image so its width does not exceed `max_width`, preserving
+/// aspect ratio. Returns the image unchanged if it already fits.
+pub fn downscale_to_width(img: image::RgbaImage, max_width: u32) -> image::RgbaImage {
+    if img.width() <= max_width || max_width == 0 {
+        return img;
+    }
+    let new_h = ((img.height() as u64 * max_width as u64) / img.width() as u64).max(1) as u32;
+    image::imageops::resize(&img, max_width, new_h, image::imageops::FilterType::Triangle)
 }
 
 /// Align a value up to the given alignment (must be a power of 2).

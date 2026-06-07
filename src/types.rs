@@ -14,7 +14,7 @@ pub struct CandidateParams {
     pub y: f32,
     /// Rotation angle in radians
     pub rotation: f32,
-    /// Scale factor for the shape
+    /// Scale factor for the shape along its local X axis
     pub scale: f32,
     /// Red channel (0.0–1.0)
     pub r: f32,
@@ -24,8 +24,16 @@ pub struct CandidateParams {
     pub b: f32,
     /// Alpha/opacity (0.1–1.0)
     pub alpha: f32,
-    /// Padding to align struct to 48 bytes
-    pub _padding: [f32; 3],
+    /// Scale factor for the shape along its local Y axis. Equals `scale` for
+    /// uniform scaling; differs only when `evolve_non_uniform_scale` is enabled
+    /// (lets shapes stretch/squash along a single axis).
+    pub scale_y: f32,
+    /// Whether to render the shape in its ORIGINAL texture colors (1.0) or to
+    /// tint it by (r, g, b) using the shape's luminance (0.0). Set from the
+    /// `use_original_colors` setting and inherited by all mutations.
+    pub use_original_color: f32,
+    /// Padding to keep the struct at 48 bytes for GPU buffer packing.
+    pub _padding: f32,
 }
 
 /// A shape that has been placed on the canvas, with tracking for temporal coherence in video mode.

@@ -10,13 +10,21 @@ use crate::types::ShapeLayer;
 const MAX_SHAPES: usize = 256;
 
 /// Load PNG shape files from a folder, resize them to the given resolution,
-/// and convert to grayscale with preserved alpha.
+/// and convert to grayscale with preserved alpha (or keep original colors).
+///
+/// When `preserve_color` is false (default behaviour) each shape is converted
+/// to a grayscale brush with its alpha preserved — the algorithm later tints it.
+/// When `preserve_color` is true the shapes keep their original RGB colors
+/// (for the `use_original_colors` mode); alpha is taken from the image if it has
+/// transparency, otherwise it is derived from luminance so the shape silhouette
+/// is preserved.
 ///
 /// Returns up to 256 shape layers sorted alphabetically by filename.
 /// Skips undecodable PNGs with a warning. Returns an error if no valid shapes are found.
 pub fn load_and_preprocess(
     folder: &Path,
     shape_resolution: u32,
+    preserve_color: bool,
 ) -> Result<Vec<ShapeLayer>, AppError> {
     // Collect PNG file paths sorted alphabetically
     let mut png_paths: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
@@ -63,7 +71,11 @@ pub fn load_and_preprocess(
                 );
 
                 let rgba = resized.to_rgba8();
-                let pixels = convert_to_grayscale_alpha(&rgba, shape_resolution);
+                let pixels = if preserve_color {
+                    convert_to_color_alpha(&rgba, shape_resolution)
+                } else {
+                    convert_to_grayscale_alpha(&rgba, shape_resolution)
+                };
 
                 layers.push(ShapeLayer { pixels });
             }
@@ -123,6 +135,39 @@ fn convert_to_grayscale_alpha(
         output.push(luminance);
         output.push(luminance);
         output.push(a);
+    }
+
+    output
+}
+
+/// Keep an RGBA8 image's ORIGINAL colors, preserving (or deriving) its alpha.
+///
+/// If the image already has meaningful transparency (any alpha < 250), the
+/// original RGB and alpha are kept verbatim. Otherwise the image is fully
+/// opaque, so alpha is derived from per-pixel luminance — bright pixels stay
+/// opaque, dark ones become transparent — to recover a shape silhouette while
+/// keeping the original colors. Mirrors the alpha handling in the
+/// `prepare_shapes` example but never discards color.
+fn convert_to_color_alpha(
+    img: &image::RgbaImage,
+    shape_resolution: u32,
+) -> Vec<u8> {
+    let pixel_count = (shape_resolution * shape_resolution) as usize;
+    let mut output = Vec::with_capacity(pixel_count * 4);
+
+    let has_alpha = img.pixels().any(|p| p.0[3] < 250);
+
+    for pixel in img.pixels() {
+        let [r, g, b, a] = pixel.0;
+        let alpha = if has_alpha {
+            a
+        } else {
+            (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64).round() as u8
+        };
+        output.push(r);
+        output.push(g);
+        output.push(b);
+        output.push(alpha);
     }
 
     output
