@@ -16,6 +16,20 @@ settings.toml
 /output/*
 !/output/.gitkeep
 
+# Runtime-generated UI state and user presets
+ui_language.txt
+/presets/
+
+# Internal / development notes (not part of the public package)
+PROJECT_OVERVIEW.md
+check_result.txt
+
+# Bad Apple addon — large source clips live here; users supply their own video
+/bad apple addon/
+
+# Packaged distribution build (contains the compiled binary)
+/release/
+
 .idea/
 .vscode/
 *.swp

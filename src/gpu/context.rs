@@ -172,10 +172,10 @@ impl GpuContext {
             );
         }
 
-        // Candidate buffer: storage buffer holding candidate parameters (48 bytes each)
+        // Candidate buffer: storage buffer holding candidate parameters (size_of::<CandidateParams>() bytes each)
         let candidate_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Candidate Buffer"),
-            size: (48 * batch_size) as u64,
+            size: (std::mem::size_of::<CandidateParams>() as u32 * batch_size) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -726,7 +726,7 @@ impl GpuContext {
         // Buffers
         let candidate_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Candidate Buffer"),
-            size: (48 * batch_size) as u64,
+            size: (std::mem::size_of::<CandidateParams>() as u32 * batch_size) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -923,12 +923,17 @@ impl GpuContext {
                 )
             })?;
 
+        // Request the adapter's full capabilities (instead of the conservative
+        // `Limits::default()`), so that `max_texture_array_layers` reflects what
+        // the GPU actually supports. The default caps array layers at 256, which
+        // in turn caps the number of shape brushes; real desktop GPUs support
+        // 2048, enabling much larger shape sets (e.g. one brush per video frame).
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("GPU Image Approximator Device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -1004,12 +1009,15 @@ impl GpuContext {
             .unwrap_or(caps.formats[0]);
         log::info!("Surface format: {:?}", surface_format);
 
+        // Request the adapter's full capabilities so `max_texture_array_layers`
+        // reflects the real GPU limit (default caps it at 256). This raises the
+        // ceiling on how many shape brushes can be uploaded as array layers.
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("GPU Image Approximator Device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,

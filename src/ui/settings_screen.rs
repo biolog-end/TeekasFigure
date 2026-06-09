@@ -8,12 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::io::media_loader;
 use crate::settings::{self, Settings};
 
 use super::i18n::{self, Language};
-
-/// Image/video extensions shown in the media picker (case-insensitive).
-const MEDIA_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "mp4"];
 
 /// Result of rendering the settings screen for one frame.
 pub enum ScreenAction {
@@ -84,7 +82,7 @@ impl SettingsScreen {
                 p.is_file()
                     && p.extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| MEDIA_EXTENSIONS.iter().any(|m| e.eq_ignore_ascii_case(m)))
+                        .map(media_loader::is_supported_extension)
                         .unwrap_or(false)
             })
             .collect();
@@ -136,9 +134,7 @@ impl SettingsScreen {
     fn selected_is_video(&self) -> bool {
         self.selected_media
             .and_then(|i| self.media_files.get(i))
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("mp4"))
+            .map(|p| media_loader::is_video_path(p))
             .unwrap_or(false)
     }
 
@@ -201,8 +197,8 @@ impl SettingsScreen {
             ui.colored_label(
                 egui::Color32::from_rgb(255, 200, 60),
                 lang.t(
-                    "No media found. Put a PNG/JPG/BMP/MP4 into input_media/ and press Refresh.",
-                    "Файлы не найдены. Положите PNG/JPG/BMP/MP4 в input_media/ и нажмите «Обновить».",
+                    "No media found. Put an image (PNG/JPG/WebP/...) or video (MP4/MOV/MKV/...) into input_media/ and press Refresh.",
+                    "Файлы не найдены. Положите изображение (PNG/JPG/WebP/…) или видео (MP4/MOV/MKV/…) в input_media/ и нажмите «Обновить».",
                 ),
             );
             return;
@@ -339,7 +335,7 @@ impl SettingsScreen {
             .default_open(true)
             .show(ui, |ui| {
                 slider_u32(ui, true, &mut self.settings.batch_size, 1..=4096, lang.t("Batch size (initial population)", "Размер пакета (нач. популяция)"));
-                slider_u32(ui, true, &mut self.settings.max_shapes, 1..=100_000, lang.t("Max shapes", "Макс. фигур"));
+                slider_u32(ui, true, &mut self.settings.max_shapes, 1..=1_000_000, lang.t("Max shapes", "Макс. фигур"));
                 slider_u32(ui, true, &mut self.settings.mutations_per_frame, 1..=100, lang.t("Placements per frame", "Размещений за кадр"));
                 slider_u32(ui, true, &mut self.settings.max_texture_size, 16..=2048, lang.t("Max texture size (px)", "Макс. размер текстуры (px)"));
                 slider_u32(ui, true, &mut self.settings.vram_budget_mb, 128..=4096, lang.t("VRAM budget (MB)", "Бюджет VRAM (МБ)"));
@@ -354,6 +350,18 @@ impl SettingsScreen {
                 toggle(ui, true, &mut self.settings.evolve_opacity, lang.t("Evolve opacity", "Эволюция прозрачности"));
                 toggle(ui, true, &mut self.settings.use_original_colors, lang.t("Use original shape colors (raw_shapes/)", "Оригинальные цвета фигур (raw_shapes/)"));
                 toggle(ui, true, &mut self.settings.evolve_non_uniform_scale, lang.t("Non-uniform (per-axis) scale", "Неравномерный масштаб по осям"));
+
+                // Hue/saturation evolution only makes sense in real-color mode.
+                let real_color = self.settings.use_original_colors;
+                if !real_color {
+                    ui.label(egui::RichText::new(lang.t(
+                        "Hue / saturation evolution applies only in original-color mode.",
+                        "Эволюция оттенка/насыщенности работает только в режиме реального цвета.",
+                    )).weak().italics());
+                }
+                toggle(ui, real_color, &mut self.settings.evolve_hue, lang.t("Evolve hue (real-color mode)", "Эволюция оттенка (реальный цвет)"));
+                toggle(ui, real_color, &mut self.settings.evolve_saturation, lang.t("Evolve saturation (real-color mode)", "Эволюция насыщенности (реальный цвет)"));
+                toggle(ui, real_color, &mut self.settings.evolve_brightness, lang.t("Evolve brightness (real-color mode)", "Эволюция яркости (реальный цвет)"));
             });
 
         egui::CollapsingHeader::new(lang.t("Evolution algorithm", "Алгоритм эволюции"))
@@ -405,7 +413,7 @@ impl SettingsScreen {
                 slider_u32(ui, gif_params, &mut self.settings.gif_max_width, 16..=2048, lang.t("Max GIF width (px)", "Макс. ширина GIF (px)"));
             });
 
-        egui::CollapsingHeader::new(lang.t("Video (used for .mp4 input)", "Видео (для .mp4)"))
+        egui::CollapsingHeader::new(lang.t("Video (used for video input)", "Видео (для видео-файлов)"))
             .default_open(is_video)
             .show(ui, |ui| {
                 if !is_video {

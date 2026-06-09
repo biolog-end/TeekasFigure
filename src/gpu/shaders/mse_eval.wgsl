@@ -14,7 +14,11 @@ struct CandidateParams {
     alpha: f32,
     scale_y: f32,
     use_original_color: f32,
-    _pad2: f32,
+    hue_shift: f32,
+    saturation_scale: f32,
+    brightness_scale: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 struct EvalUniforms {
@@ -33,6 +37,36 @@ struct EvalUniforms {
 @group(0) @binding(5) var<uniform> uniforms: EvalUniforms;
 
 var<workgroup> partial_sums: array<f32, 256>;
+
+// Convert RGB (0..1) to HSV (h,s,v in 0..1). Branchless (IQ-style).
+fn rgb2hsv(c: vec3<f32>) -> vec3<f32> {
+    let K = vec4<f32>(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    let p = mix(vec4<f32>(c.bg, K.wz), vec4<f32>(c.gb, K.xy), step(c.b, c.g));
+    let q = mix(vec4<f32>(p.xyw, c.r), vec4<f32>(c.r, p.yzx), step(p.x, c.r));
+    let d = q.x - min(q.w, q.y);
+    let e = 1.0e-10;
+    return vec3<f32>(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+// Convert HSV (0..1) back to RGB (0..1).
+fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
+    let K = vec4<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    let p = abs(fract(vec3<f32>(c.x) + K.xyz) * 6.0 - vec3<f32>(K.w));
+    return c.z * mix(vec3<f32>(K.x), clamp(p - vec3<f32>(K.x), vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+}
+
+// Apply hue rotation + saturation scaling to an original shape color. Skips the
+// HSV round-trip entirely when both are neutral (the common case).
+fn evolve_original_color(rgb: vec3<f32>, hue_shift: f32, saturation_scale: f32, brightness_scale: f32) -> vec3<f32> {
+    if (hue_shift == 0.0 && saturation_scale == 1.0 && brightness_scale == 1.0) {
+        return rgb;
+    }
+    var hsv = rgb2hsv(rgb);
+    hsv.x = fract(hsv.x + hue_shift);
+    hsv.y = clamp(hsv.y * saturation_scale, 0.0, 1.0);
+    hsv.z = clamp(hsv.z * brightness_scale, 0.0, 1.0);
+    return hsv2rgb(hsv);
+}
 
 @compute @workgroup_size(256)
 fn eval_mse(
@@ -144,7 +178,7 @@ fn eval_mse(
             // candidate color by the grayscale luminance (classic mode).
             var shape_color: vec3<f32>;
             if candidate.use_original_color > 0.5 {
-                shape_color = shape_texel.rgb;
+                shape_color = evolve_original_color(shape_texel.rgb, candidate.hue_shift, candidate.saturation_scale, candidate.brightness_scale);
             } else {
                 let luminance = shape_texel.r;
                 shape_color = vec3<f32>(candidate.r, candidate.g, candidate.b) * luminance;

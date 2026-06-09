@@ -2,7 +2,7 @@
 
 **GPU-accelerated evolutionary image & video approximation using geometric shapes**
 
-[🇷🇺 Читать на русском](README_ru.md)
+[Читать на понятном](README_ru.md)
 
 ---
 
@@ -23,6 +23,7 @@ The algorithm evolves a population of shape candidates through tournament select
 - **Built-in Settings UI** — Configure everything in-app (English/Russian) with smart sliders and toggles, a file picker, and savable presets — no need to hand-edit `settings.toml`.
 - **Progress GIF** — Optionally save an animated GIF of the creation process next to the result image.
 - **Audio-preserving video** — The original soundtrack of a video is kept in the rendered MP4.
+- **Broad input format support** — Images: PNG, JPG/JPEG, WebP, BMP, GIF (first frame), TIFF, TGA, ICO, QOI, PNM and more (via the `image` crate). Videos: MP4, MOV, MKV, AVI, WebM, WMV, M4V, MPG/MPEG, TS, 3GP, OGV and more (decoded natively by FFmpeg — no manual conversion needed). Output is always rendered to MP4.
 - **Highly Configurable** — Detailed control over evolution, shape life cycles, and the video pipeline via the in-app UI and the `settings.toml` file.
 
 ### Requirements
@@ -62,7 +63,7 @@ On the next launch the form loads its initial values straight from `settings.tom
 
 ```text
 TeekasFigure/
-├── input_media/       ← Place your target image (PNG/JPG/BMP) or video (MP4) here
+├── input_media/       ← Place your target image (PNG/JPG/WebP/BMP/...) or video (MP4/MOV/MKV/AVI/WebM/...) here
 ├── raw_shapes/        ← Place your raw custom images/brushes here
 ├── input_shapes/      ← Program reads prepared textures from here (do NOT put raw files here!)
 ├── output/            ← Finished artworks (PNG, MP4, and optional _process.gif) are saved here
@@ -81,6 +82,28 @@ Instead, place your raw images (PNG, JPG, BMP, WebP) into the `raw_shapes/` fold
 cargo run --example prepare_shapes
 ```
 This script will automatically crop, recolor, and move the ready-to-use optimized textures into the `input_shapes/` folder.
+
+### 🍎 Bad Apple Addon (optional)
+
+There's a bonus tool for the classic "Bad Apple!!"-style effect: rebuild a black-and-white silhouette video out of its **own** frames. The `prepare_bad_apple` example samples frames from such a clip, strips the solid background to transparency, draws a clean outline around each silhouette, and saves them as colored brushes in `raw_shapes/`.
+
+```bash
+cargo run --release --example prepare_bad_apple -- "path/to/clip.mp4"
+```
+(or just run `prepare_bad_apple.bat` and pass your own video path)
+
+| Option | Description |
+|--------|-------------|
+| `--interval <sec>` | Seconds between sampled frames (default `2.0`). |
+| `--out <folder>` | Output folder for the shape PNGs (default `raw_shapes`). |
+| `--max-size <px>` | Longest side of each output shape in pixels (default `512`). |
+| `--mono <0..1>` | Drop near-blank frames where a single near-pure color covers ≥ this fraction (default `0.97`). |
+| `--bg-tol <0..255>` | How far from pure white/black still counts as removable background (default `40`). |
+| `--outline <px>` | Thickness of the silhouette outline drawn in the background color (default `3`). |
+
+After preparing the brushes: put the source clip into `input_media/`, set `use_original_colors = true` in `settings.toml` (so the black/white fills are kept intact), then run the app to approximate the video.
+
+> **Note:** the source video and the `bad apple addon/` folder are intentionally excluded from version control. Supply your own clip — FFmpeg must be in your PATH.
 
 ### Configuration (`settings.toml`)
 
@@ -122,6 +145,9 @@ All parameters are generated in the `settings.toml` file upon the first launch. 
 | **`evolve_opacity`** | Whether to allow the algorithm to pick varying opacity (`true`), or always draw fully opaque strokes (`false`). |
 | **`use_original_colors`** | Use the shapes' original colors (`true`) instead of tinting grayscale brushes (`false`, default). When `true`, shapes are loaded from the **`raw_shapes/`** folder keeping their original RGB colors and are never recolored — only placed/moved/rotated/scaled. Put your colored PNG shapes (ideally with transparency) into `raw_shapes/`. |
 | **`evolve_non_uniform_scale`** | Allow independent X/Y axis scaling (`true`) so shapes can stretch and squash (circle → ellipse, square → rectangle). Default `false` (uniform scaling). |
+| **`evolve_hue`** | Real-color mode only (`use_original_colors = true`). Evolve the **hue** of the shapes' original colors (`true`) so each shape can rotate its color around the wheel to better match the target. Default `false`. |
+| **`evolve_saturation`** | Real-color mode only (`use_original_colors = true`). Evolve the **saturation** of the shapes' original colors (`true`) so each shape can become more/less vivid to better match the target. Default `false`. |
+| **`evolve_brightness`** | Real-color mode only (`use_original_colors = true`). Evolve the **brightness** (value) of the shapes' original colors (`true`) so each shape can become darker or brighter to better match the target. Default `false`. |
 | **`num_generations`** | Number of evolutionary generations (tournaments and mutations) to find the perfect shape. |
 | **`min_improvement`** | Minimum MSE improvement threshold required to accept a stroke (negative = improvement). |
 | **`use_min_improvement`** | Whether to enforce the `min_improvement` threshold. **Important: disable this when using `diversity_mode`!** |

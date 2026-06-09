@@ -255,11 +255,26 @@ impl App {
             shapes_folder.display(),
             settings.use_original_colors
         );
-        let shapes = io::shape_preprocessor::load_and_preprocess(
+        let mut shapes = io::shape_preprocessor::load_and_preprocess(
             &shapes_folder,
             settings.shape_resolution,
             preserve_color,
         )?;
+        // Each shape occupies one layer of a GPU texture array, so the count is
+        // hard-bounded by the device's `max_texture_array_layers`. Clamp here to
+        // avoid a device error when more brushes were prepared than the GPU can
+        // hold as array layers.
+        let max_layers = self.device.limits().max_texture_array_layers as usize;
+        if shapes.len() > max_layers {
+            log::warn!(
+                "Loaded {} shapes but GPU supports only {} texture array layers; \
+                 using the first {}.",
+                shapes.len(),
+                max_layers,
+                max_layers
+            );
+            shapes.truncate(max_layers);
+        }
         io::shape_preprocessor::check_vram_budget(
             settings.shape_resolution,
             shapes.len() as u32,
@@ -697,23 +712,36 @@ impl GenerationContext {
                     let before = pipeline.shapes.len();
                     let dead =
                         pipeline.adapt_to_new_frame(&self.gpu, &mut self.generator, &self.settings);
+                    // After adapting/replacing existing shapes, grow the
+                    // population toward max_shapes so new content appearing in
+                    // later frames actually gets represented (the frame may have
+                    // started nearly empty — e.g. a black opening frame — and
+                    // would otherwise stay frozen at a handful of shapes for the
+                    // whole clip).
+                    let grown = pipeline.grow_population(
+                        &self.gpu,
+                        &mut self.generator,
+                        &self.settings,
+                    );
                     log::info!(
-                        "Frame {}: adapted {} shapes, {} died (scene change), {} remain",
+                        "Frame {}: adapted {} shapes, {} died (scene change), {} grown, {} total",
                         frame_num + 1,
                         before,
                         dead,
+                        grown,
                         pipeline.shapes.len()
                     );
                     pipeline.rebuild_canvas(&self.gpu);
                 }
 
-                // Population is frozen after frame 0: mark the climber as full so
-                // its next step Completes and simply advances to the next frame.
+                // The climber no longer drives video shape placement (growth is
+                // handled by the pipeline above). Mark it full so its next step
+                // Completes and simply advances to the next frame.
                 self.climber = HillClimber::new();
                 self.climber.placed_shapes = self.settings.max_shapes;
                 if let Some(ref pipeline) = self.video_pipeline {
                     log::info!(
-                        "Frame {}: {} shapes after adaptation + rebirth (population frozen, no refill repaint)",
+                        "Frame {}: {} shapes after adaptation + rebirth + growth",
                         self.overlay.frame_number + 1,
                         pipeline.shapes.len(),
                     );

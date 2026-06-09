@@ -301,6 +301,81 @@ impl VideoPipeline {
         dead_count
     }
 
+    /// Grow the population toward `max_shapes` by evolving brand-new shapes,
+    /// exactly the way the hill climber fills the canvas on the first frame.
+    ///
+    /// Without this, a frame that started nearly empty (e.g. a black opening
+    /// frame where the climber placed a single shape and then converged) would
+    /// keep that tiny population *forever*: `adapt_to_new_frame` only nudges the
+    /// existing shapes and replaces the ones that die, it never adds NET-new
+    /// detail. So as soon as real content appears later in the clip there are
+    /// no shapes available to represent it. This pass closes that gap.
+    ///
+    /// Each newcomer goes through the FULL evolutionary cycle
+    /// (`evolve_best_candidate`) and is accepted on the SAME criterion the hill
+    /// climber uses:
+    ///   * if `use_min_improvement` is on, only a shape whose best score beats
+    ///     `min_improvement` (i.e. it improves the frame enough) is kept;
+    ///   * otherwise every evolved shape is added until the population reaches
+    ///     `max_shapes`.
+    /// A run of `max_rejections` consecutive non-improving candidates stops the
+    /// growth early for this frame, mirroring the climber's convergence test —
+    /// so an still-mostly-empty frame adds little or nothing, and a busy frame
+    /// fills right up to `max_shapes`.
+    ///
+    /// New shapes are flagged `just_born` so they fade in over interpolation,
+    /// and each is composited immediately so the next evolution targets the
+    /// next-worst remaining gap. Returns the number of shapes added.
+    pub fn grow_population(
+        &mut self,
+        gpu: &GpuContext,
+        generator: &mut CandidateGenerator,
+        settings: &Settings,
+    ) -> u32 {
+        let mut added: u32 = 0;
+        let mut consecutive_rejections: u32 = 0;
+
+        while (self.shapes.len() as u32) < settings.max_shapes {
+            // Converged for this frame: too many candidates in a row failed to
+            // improve it enough, so further attempts won't help.
+            if consecutive_rejections >= settings.max_rejections {
+                break;
+            }
+
+            // Full evolution against the up-to-date canvas. `placed_shapes` is
+            // the live population so the adaptive scale shrinks as the frame
+            // fills, just like on the first keyframe.
+            let placed = self.shapes.len() as u32;
+            let Some((candidate, score)) =
+                evolve_best_candidate(gpu, generator, settings, placed, &mut self.rng)
+            else {
+                break;
+            };
+
+            // Accept on the climber's criterion: when min-improvement gating is
+            // on, the candidate must actually improve the frame; otherwise we
+            // keep filling toward max_shapes unconditionally.
+            let accept = !settings.use_min_improvement || score < settings.min_improvement;
+            if accept {
+                gpu.composite_shape(&candidate);
+                let id = self.next_id;
+                self.next_id += 1;
+                self.shapes.push(PlacedShapeRecord {
+                    id,
+                    params: candidate,
+                    prev_params: candidate, // newborn: no motion, fade-in only
+                    just_born: true,
+                });
+                added += 1;
+                consecutive_rejections = 0;
+            } else {
+                consecutive_rejections += 1;
+            }
+        }
+
+        added
+    }
+
     /// Rebuild the canvas from scratch using the current ordered shape list.
     /// Useful before the hill climber starts filling vacancies, so that it
     /// evaluates new candidates against the up-to-date canvas state.
@@ -397,6 +472,29 @@ impl VideoPipeline {
             (parent.r, parent.g, parent.b)
         };
 
+        // Hue/saturation: tiny nudges in real-color mode with the matching
+        // toggle on, so the palette can drift to track the new frame; otherwise
+        // the parent's neutral value is preserved.
+        let new_hue_shift = if settings.evolve_hue {
+            let dh = self.rng.gen_range(-0.02_f32..=0.02);
+            (parent.hue_shift + dh).rem_euclid(1.0)
+        } else {
+            parent.hue_shift
+        };
+        let new_saturation_scale = if settings.evolve_saturation {
+            let sf = self.rng.gen_range(0.95_f32..=1.05);
+            (parent.saturation_scale * sf).clamp(0.0, 2.0)
+        } else {
+            parent.saturation_scale
+        };
+
+        let new_brightness_scale = if settings.evolve_brightness {
+            let bf = self.rng.gen_range(0.95_f32..=1.05);
+            (parent.brightness_scale * bf).clamp(0.2, 2.0)
+        } else {
+            parent.brightness_scale
+        };
+
         CandidateParams {
             shape_index: parent.shape_index,
             x: new_x,
@@ -407,7 +505,10 @@ impl VideoPipeline {
             alpha: new_alpha,
             scale_y: new_scale_y,
             use_original_color: parent.use_original_color,
-            _padding: 0.0,
+            hue_shift: new_hue_shift,
+            saturation_scale: new_saturation_scale,
+            brightness_scale: new_brightness_scale,
+            _padding: [0.0; 2],
         }
     }
 
@@ -515,7 +616,10 @@ pub fn lerp_params(a: &CandidateParams, b: &CandidateParams, t: f32) -> Candidat
         alpha: a.alpha * inv + b.alpha * t,
         scale_y: a.scale_y * inv + b.scale_y * t,
         use_original_color: b.use_original_color,
-        _padding: 0.0,
+        hue_shift: a.hue_shift * inv + b.hue_shift * t,
+        saturation_scale: a.saturation_scale * inv + b.saturation_scale * t,
+        brightness_scale: a.brightness_scale * inv + b.brightness_scale * t,
+        _padding: [0.0; 2],
     }
 }
 
@@ -531,7 +635,10 @@ mod tests {
             alpha,
             scale_y: scale,
             use_original_color: 0.0,
-            _padding: 0.0,
+            hue_shift: 0.0,
+            saturation_scale: 1.0,
+            brightness_scale: 1.0,
+            _padding: [0.0; 2],
         }
     }
 

@@ -6,15 +6,35 @@ use image::DynamicImage;
 
 use crate::error::AppError;
 
-/// Supported media file extensions (case-insensitive).
-const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp"];
-const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &["mp4"];
+/// Supported still-image extensions (case-insensitive).
+///
+/// These are decoded directly by the `image` crate, whose default features
+/// cover PNG, JPEG, BMP, WebP, GIF (first frame), TIFF, TGA, ICO, QOI, PNM
+/// and a few others. For animated containers (GIF) only the first frame is
+/// used in image mode.
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "jpe", "bmp", "webp", "gif", "tif", "tiff", "tga", "ico", "qoi", "pnm",
+    "ppm", "pgm", "pbm", "dds", "ff", "hdr",
+];
+
+/// Supported video container extensions (case-insensitive).
+///
+/// Every video path is decoded/probed exclusively through FFmpeg (ffprobe +
+/// ffmpeg raw-RGBA pipes), so any container FFmpeg can read works without a
+/// separate conversion step. The rendered result is always re-encoded to MP4
+/// (libx264 / yuv420p). To accept more formats it is enough to list their
+/// extensions here.
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "mkv", "avi", "webm", "flv", "wmv", "m4v", "mpg", "mpeg", "m2v", "ts", "m2ts",
+    "mts", "3gp", "3g2", "ogv", "vob", "f4v", "asf",
+];
 
 /// Represents the type of media loaded from the input folder.
 pub enum MediaType {
-    /// A successfully loaded image (PNG, JPG, BMP).
+    /// A successfully loaded still image (any [`SUPPORTED_IMAGE_EXTENSIONS`]).
     Image(DynamicImage),
-    /// A detected video file (MP4) — path stored for FFmpeg processing.
+    /// A detected video file (any [`SUPPORTED_VIDEO_EXTENSIONS`]) — path stored
+    /// for FFmpeg processing.
     Video(PathBuf),
 }
 
@@ -51,7 +71,7 @@ pub fn ensure_directories(base: &Path) -> Result<Vec<String>, AppError> {
 }
 
 /// Finds the alphabetically first file in `folder` whose extension matches
-/// a supported format (PNG, JPG, JPEG, BMP, MP4). Extension matching is case-insensitive.
+/// a supported image or video format. Extension matching is case-insensitive.
 ///
 /// Returns `None` if the folder doesn't exist, is empty, or contains no supported files.
 pub fn find_first_supported_file(folder: &Path) -> Option<PathBuf> {
@@ -81,7 +101,7 @@ pub fn find_first_supported_file(folder: &Path) -> Option<PathBuf> {
 }
 
 /// Loads media from the given path. Images are decoded via the `image` crate.
-/// Video files (MP4) are returned as a path for later FFmpeg processing.
+/// Video files are returned as a path for later FFmpeg processing.
 pub fn load_media(path: &Path) -> Result<MediaType, AppError> {
     let extension = path
         .extension()
@@ -89,7 +109,7 @@ pub fn load_media(path: &Path) -> Result<MediaType, AppError> {
         .map(|ext| ext.to_lowercase())
         .unwrap_or_default();
 
-    if SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+    if is_video_extension(&extension) {
         // For video files, just verify the file exists and return the path
         if !path.exists() {
             return Err(AppError::NoMedia {
@@ -225,15 +245,28 @@ fn extract_first_video_frame(video_path: &Path) -> Result<(Vec<u8>, (u32, u32)),
 }
 
 /// Checks if an extension (case-insensitive) is any supported format (image or video).
-fn is_supported_extension(ext: &str) -> bool {
-    let lower = ext.to_lowercase();
-    SUPPORTED_IMAGE_EXTENSIONS.contains(&lower.as_str())
-        || SUPPORTED_VIDEO_EXTENSIONS.contains(&lower.as_str())
+pub fn is_supported_extension(ext: &str) -> bool {
+    is_supported_image_extension(ext) || is_video_extension(ext)
 }
 
-/// Checks if an extension (already lowercased) is a supported image format.
-fn is_supported_image_extension(ext: &str) -> bool {
-    SUPPORTED_IMAGE_EXTENSIONS.contains(&ext)
+/// Checks if an extension (case-insensitive) is a supported still-image format.
+pub fn is_supported_image_extension(ext: &str) -> bool {
+    let lower = ext.to_lowercase();
+    SUPPORTED_IMAGE_EXTENSIONS.contains(&lower.as_str())
+}
+
+/// Checks if an extension (case-insensitive) is a supported video container.
+pub fn is_video_extension(ext: &str) -> bool {
+    let lower = ext.to_lowercase();
+    SUPPORTED_VIDEO_EXTENSIONS.contains(&lower.as_str())
+}
+
+/// Returns `true` if the path's extension is a supported video container.
+pub fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(is_video_extension)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -344,5 +377,42 @@ mod tests {
 
         let result = load_media(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extended_video_extensions_recognized() {
+        for ext in ["mp4", "mov", "mkv", "avi", "webm", "wmv", "m4v", "MOV"] {
+            assert!(is_video_extension(ext), "expected '{ext}' to be a video");
+            assert!(is_supported_extension(ext), "expected '{ext}' supported");
+            assert!(!is_supported_image_extension(ext), "'{ext}' is not an image");
+        }
+    }
+
+    #[test]
+    fn test_extended_image_extensions_recognized() {
+        for ext in ["png", "jpg", "jpeg", "bmp", "webp", "gif", "tiff", "tga", "ico", "PNG"] {
+            assert!(is_supported_image_extension(ext), "expected '{ext}' image");
+            assert!(is_supported_extension(ext), "expected '{ext}' supported");
+            assert!(!is_video_extension(ext), "'{ext}' is not a video");
+        }
+    }
+
+    #[test]
+    fn test_load_media_mov_treated_as_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let video_path = dir.path().join("clip.mov");
+        File::create(&video_path).unwrap();
+
+        match load_media(&video_path).unwrap() {
+            MediaType::Video(p) => assert_eq!(p, video_path),
+            _ => panic!("Expected Video variant for .mov"),
+        }
+    }
+
+    #[test]
+    fn test_is_video_path_helper() {
+        assert!(is_video_path(Path::new("a/b/clip.MKV")));
+        assert!(!is_video_path(Path::new("a/b/photo.jpg")));
+        assert!(!is_video_path(Path::new("noextension")));
     }
 }

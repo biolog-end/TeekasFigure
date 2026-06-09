@@ -2,7 +2,7 @@
 
 /// GPU-compatible candidate shape parameters.
 /// Each candidate represents a proposed shape placement with position, rotation, scale, and color.
-/// Aligned to 48 bytes for efficient GPU buffer packing.
+/// Aligned to 64 bytes (multiple of 16) for efficient GPU storage/uniform buffer packing.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CandidateParams {
@@ -32,8 +32,22 @@ pub struct CandidateParams {
     /// tint it by (r, g, b) using the shape's luminance (0.0). Set from the
     /// `use_original_colors` setting and inherited by all mutations.
     pub use_original_color: f32,
-    /// Padding to keep the struct at 48 bytes for GPU buffer packing.
-    pub _padding: f32,
+    /// Hue rotation applied to the shape's ORIGINAL colors, in turns [0.0, 1.0)
+    /// (0.0 = no shift, 0.5 = +180°). Only meaningful in original-color mode and
+    /// only evolved when `evolve_hue` is enabled; otherwise stays 0.0.
+    pub hue_shift: f32,
+    /// Saturation multiplier applied to the shape's ORIGINAL colors (1.0 = no
+    /// change, 0.0 = greyscale, >1.0 = more vivid). Only meaningful in
+    /// original-color mode and only evolved when `evolve_saturation` is enabled;
+    /// otherwise stays 1.0.
+    pub saturation_scale: f32,
+    /// Brightness (value) multiplier applied to the shape's ORIGINAL colors
+    /// (1.0 = no change, 0.0 = black, >1.0 = brighter). Only meaningful in
+    /// original-color mode and only evolved when `evolve_brightness` is enabled;
+    /// otherwise stays 1.0.
+    pub brightness_scale: f32,
+    /// Padding to keep the struct at 64 bytes (multiple of 16) for GPU buffer packing.
+    pub _padding: [f32; 2],
 }
 
 /// A shape that has been placed on the canvas, with tracking for temporal coherence in video mode.

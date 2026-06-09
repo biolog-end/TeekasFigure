@@ -93,6 +93,27 @@ impl CandidateGenerator {
 
             let (r, g, b) = self.sample_color_at(x as u32, y as u32);
 
+            let (hue_shift, saturation_scale, brightness_scale) = if self.settings.use_original_colors {
+                let hue_shift = if self.settings.evolve_hue {
+                    self.rng.gen_range(0.0..1.0_f32)
+                } else {
+                    0.0
+                };
+                let saturation_scale = if self.settings.evolve_saturation {
+                    self.rng.gen_range(0.0..=2.0_f32)
+                } else {
+                    1.0
+                };
+                let brightness_scale = if self.settings.evolve_brightness {
+                    self.rng.gen_range(0.2..=2.0_f32)
+                } else {
+                    1.0
+                };
+                (hue_shift, saturation_scale, brightness_scale)
+            } else {
+                (0.0, 1.0, 1.0)
+            };
+
             candidates.push(CandidateParams {
                 shape_index,
                 x,
@@ -105,7 +126,10 @@ impl CandidateGenerator {
                 alpha,
                 scale_y,
                 use_original_color: if self.settings.use_original_colors { 1.0 } else { 0.0 },
-                _padding: 0.0,
+                hue_shift,
+                saturation_scale,
+                brightness_scale,
+                _padding: [0.0; 2],
             });
         }
 
@@ -294,7 +318,7 @@ mod tests {
 
         let batch = gen.generate_batch(10, 0, (32, 32), 2);
         for candidate in &batch {
-            assert_eq!(candidate._padding, 0.0);
+            assert_eq!(candidate._padding, [0.0; 2]);
         }
     }
 
@@ -340,5 +364,69 @@ mod tests {
         for candidate in &batch {
             assert_eq!(candidate.use_original_color, 1.0);
         }
+    }
+
+    #[test]
+    fn test_hue_saturation_neutral_when_disabled() {
+        // Real-color mode but hue/saturation/brightness evolution OFF → neutral values.
+        let mut settings = default_settings();
+        settings.use_original_colors = true;
+        settings.evolve_hue = false;
+        settings.evolve_saturation = false;
+        settings.evolve_brightness = false;
+        let target = solid_target(128, 128, 128, 32, 32);
+        let mut gen = CandidateGenerator::new(settings, target, (32, 32));
+
+        let batch = gen.generate_batch(50, 0, (32, 32), 2);
+        for candidate in &batch {
+            assert_eq!(candidate.hue_shift, 0.0);
+            assert_eq!(candidate.saturation_scale, 1.0);
+            assert_eq!(candidate.brightness_scale, 1.0);
+        }
+    }
+
+    #[test]
+    fn test_hue_saturation_evolve_only_in_real_color_mode() {
+        // Toggles on but classic (tint) mode → still neutral, never applied.
+        let mut settings = default_settings();
+        settings.use_original_colors = false;
+        settings.evolve_hue = true;
+        settings.evolve_saturation = true;
+        settings.evolve_brightness = true;
+        let target = solid_target(128, 128, 128, 32, 32);
+        let mut gen = CandidateGenerator::new(settings, target, (32, 32));
+
+        let batch = gen.generate_batch(50, 0, (32, 32), 2);
+        for candidate in &batch {
+            assert_eq!(candidate.hue_shift, 0.0);
+            assert_eq!(candidate.saturation_scale, 1.0);
+            assert_eq!(candidate.brightness_scale, 1.0);
+        }
+    }
+
+    #[test]
+    fn test_hue_saturation_randomized_in_real_color_mode() {
+        let mut settings = default_settings();
+        settings.use_original_colors = true;
+        settings.evolve_hue = true;
+        settings.evolve_saturation = true;
+        settings.evolve_brightness = true;
+        let target = solid_target(128, 128, 128, 32, 32);
+        let mut gen = CandidateGenerator::new(settings, target, (32, 32));
+
+        let batch = gen.generate_batch(200, 0, (32, 32), 2);
+        // Values stay within their valid ranges.
+        for candidate in &batch {
+            assert!(candidate.hue_shift >= 0.0 && candidate.hue_shift < 1.0,
+                "hue_shift out of range: {}", candidate.hue_shift);
+            assert!(candidate.saturation_scale >= 0.0 && candidate.saturation_scale <= 2.0,
+                "saturation_scale out of range: {}", candidate.saturation_scale);
+            assert!(candidate.brightness_scale >= 0.2 && candidate.brightness_scale <= 2.0,
+                "brightness_scale out of range: {}", candidate.brightness_scale);
+        }
+        // Probabilistically certain to differ from neutral somewhere.
+        assert!(batch.iter().any(|c| c.hue_shift != 0.0));
+        assert!(batch.iter().any(|c| (c.saturation_scale - 1.0).abs() > f32::EPSILON));
+        assert!(batch.iter().any(|c| (c.brightness_scale - 1.0).abs() > f32::EPSILON));
     }
 }

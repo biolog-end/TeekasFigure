@@ -13,7 +13,7 @@ const DEFAULT_SETTINGS_TOML: &str = r#"# GPU Image Approximator Configuration
 # Number of candidates in initial population (1–4096)
 batch_size = 1000
 
-# Maximum shapes to place before stopping (1–100000)
+# Maximum shapes to place before stopping (1–1000000)
 max_shapes = 4000
 
 # Successful placements per rendered frame (1–100)
@@ -74,6 +74,25 @@ use_original_colors = false
 # When true, a shape can scale independently along its X and Y axes, so it can stretch
 # and squash (e.g. a circle can become an ellipse, a square a rectangle) during evolution.
 evolve_non_uniform_scale = false
+
+# --- Real-color mode evolution (only used when use_original_colors = true) ---
+
+# Evolve the HUE of the shapes' original colors (true/false). Default false.
+# Only has an effect in real-color mode (use_original_colors = true). When true,
+# each shape may rotate the hue of its original texture colors to better match the
+# target, searching the full color wheel while keeping the shape's brightness.
+evolve_hue = false
+
+# Evolve the SATURATION of the shapes' original colors (true/false). Default false.
+# Only has an effect in real-color mode (use_original_colors = true). When true,
+# each shape may scale the saturation of its original texture colors (toward
+# greyscale or more vivid) to better match the target.
+evolve_saturation = false
+
+# Evolve the BRIGHTNESS (value) of the shapes' original colors (true/false). Default false.
+# Only has an effect in real-color mode (use_original_colors = true). When true,
+# each shape may darken or brighten its original texture colors to better match the target.
+evolve_brightness = false
 
 # Whether existing shapes RE-COLOR themselves to match the new frame during video
 # adaptation (true) or keep their original color and only move/rotate/scale (false).
@@ -148,7 +167,7 @@ diversity_decay_amount = 0.01
 pub struct Settings {
     /// Number of candidates evaluated per batch (1–4096).
     pub batch_size: u32,
-    /// Maximum shapes to place before stopping (1–100000).
+    /// Maximum shapes to place before stopping (1–1000000).
     pub max_shapes: u32,
     /// Successful placements per rendered frame (1–100).
     pub mutations_per_frame: u32,
@@ -182,6 +201,12 @@ pub struct Settings {
     /// Allow non-uniform (per-axis) scaling so shapes can stretch/squash along a single axis (true)
     /// or only scale uniformly (false).
     pub evolve_non_uniform_scale: bool,
+    /// Evolve the hue of shapes' original colors (only in real-color mode). Default false.
+    pub evolve_hue: bool,
+    /// Evolve the saturation of shapes' original colors (only in real-color mode). Default false.
+    pub evolve_saturation: bool,
+    /// Evolve the brightness (value) of shapes' original colors (only in real-color mode). Default false.
+    pub evolve_brightness: bool,
     /// Whether existing shapes re-color to the new frame during video adaptation (true)
     /// or keep their original color and only adapt geometry (false). Default false.
     pub video_recolor: bool,
@@ -236,6 +261,9 @@ impl Default for Settings {
             evolve_opacity: true,
             use_original_colors: false,
             evolve_non_uniform_scale: false,
+            evolve_hue: false,
+            evolve_saturation: false,
+            evolve_brightness: false,
             video_recolor: false,
             preserve_audio: true,
             save_progress_gif: false,
@@ -330,7 +358,7 @@ impl Settings {
     /// or the first `AppError::SettingsValidation` encountered.
     pub fn validate(&self) -> Result<(), AppError> {
         self.validate_u32("batch_size", self.batch_size, 1, 4096)?;
-        self.validate_u32("max_shapes", self.max_shapes, 1, 100_000)?;
+        self.validate_u32("max_shapes", self.max_shapes, 1, 1_000_000)?;
         self.validate_u32("mutations_per_frame", self.mutations_per_frame, 1, 100)?;
         self.validate_u32("max_texture_size", self.max_texture_size, 16, 2048)?;
         self.validate_u32("vram_budget_mb", self.vram_budget_mb, 128, 4096)?;
