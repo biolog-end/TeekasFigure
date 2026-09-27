@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "package": "dev.teekasfigure.exporter.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["ServerMixin", "WorldFreezeMixin", "ScaleMixin", "VisibleMixin", "DragonPoseMixin", "DisconnectMixin", "SessionSaveMixin", "WitherBarMixin", "ParticipantCacheMixin", "PlaybackTrackingMixin"],
+  "client": ["GameMenuMixin", "ClientFreezeMixin", "TrackedPoseMixin", "ProjectionMixin", "LightMixin", "FogMixin", "DragonScaleMixin", "FrustumMixin", "WorldLightMixin", "HideLabelMixin", "ClientViewMixin", "BatModelPoseMixin", "AxolotlModelPoseMixin", "TadpoleModelPoseMixin", "OrthographicFrustumMixin"],
+  "injectors": { "defaultRequire": 1 }
+}

@@ -1,0 +1,72 @@
+plugins {
+    id 'fabric-loom' version '1.7.4'
+    id 'maven-publish'
+}
+
+version = '0.1.4'
+group = 'dev.teekasfigure'
+base { archivesName = 'teekasfigure-mob-tools' }
+
+repositories { mavenCentral() }
+loom { accessWidenerPath = file('src/main/resources/teekasfigure.accesswidener') }
+dependencies {
+    minecraft 'com.mojang:minecraft:1.21.1'
+    mappings 'net.fabricmc:yarn:1.21.1+build.3:v2'
+    modImplementation 'net.fabricmc:fabric-loader:0.16.14'
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    withSourcesJar()
+}
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') { expand 'version': project.version }
+}
+
+sourceSets {
+    verify {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+    smoke {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+loom {
+    mods {
+        teekasfigure_mob_exporter { sourceSet sourceSets.main }
+        teekasfigure_smoke { sourceSet sourceSets.smoke }
+    }
+    runs {
+        smoke {
+            client()
+            source sourceSets.smoke
+            runDir 'run'
+            vmArg '-Xmx2G'
+            programArgs '--assetsDir', System.getenv('APPDATA') + '/.minecraft/assets'
+        }
+    }
+}
+// Reuse the locally installed assets only for the isolated smoke world.
+if (project.hasProperty('localAssets')) { tasks.named('downloadAssets') { enabled = false } }
+tasks.register('verifyUi', JavaExec) {
+    dependsOn tasks.named('verifyClasses')
+    classpath = files(sourceSets.main.output, sourceSets.verify.output) + configurations.compileClasspath.filter {
+        it.name.startsWith('gson-') || it.name.startsWith('lwjgl')
+    } + fileTree('.gradle-user/caches/modules-2/files-2.1/org.lwjgl') { include '**/*-natives-windows.jar' }
+    mainClass = 'dev.teekasfigure.verify.UiRegressionCheck'
+    systemProperty 'java.awt.headless', 'true'
+}
+tasks.register('verifyPlayback', JavaExec) {
+    dependsOn tasks.named('verifyClasses')
+    classpath = files(sourceSets.main.output, sourceSets.verify.output) + configurations.compileClasspath.filter { it.name.startsWith('gson-') }
+    mainClass = 'dev.teekasfigure.verify.PlaybackRegressionCheck'
+    systemProperty 'java.awt.headless', 'true'
+    if (project.hasProperty('scenePath')) { systemProperty 'scenePath', project.property('scenePath') }
+}

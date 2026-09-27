@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "teekasfigure_mob_exporter",
+  "version": "${version}",
+  "name": "TeekasFigure Mob Tools",
+  "description": "Transparent top/front mob capture, automatic view mapping and real-entity scene playback.",
+  "authors": ["TeekasFigure"],
+  "license": "MIT",
+  "environment": "client",
+  "mixins": ["teekasfigure.mixins.json"],
+  "accessWidener": "teekasfigure.accesswidener",
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21"
+  }
+}

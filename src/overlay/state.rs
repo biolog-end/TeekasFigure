@@ -1,0 +1,142 @@
+use std::time::{Duration, Instant};
+
+use crate::ui::Language;
+
+/// A timed notification displayed in the overlay.
+/// Notifications expire after a set duration and are color-coded by severity.
+#[derive(Clone)]
+pub struct Notification {
+    /// The message text to display
+    pub message: String,
+    /// When this notification should disappear
+    pub expires_at: Instant,
+    /// true = red (error), false = yellow (warning)
+    pub is_error: bool,
+}
+
+/// Holds all state needed to render the egui statistics overlay.
+/// Updated each frame by the main loop and rendered via `render()`.
+#[derive(Clone)]
+pub struct OverlayState {
+    /// Current frame number (meaningful in video mode)
+    pub frame_number: u32,
+    /// Number of shapes successfully placed on the canvas
+    pub placed_shapes: u32,
+    /// Maximum shapes allowed (from settings)
+    pub max_shapes: u32,
+    /// Frames per second (presentation rate)
+    pub fps: f32,
+    /// Active notifications (timed messages)
+    pub notifications: Vec<Notification>,
+    /// Whether we are in video mode (shows frame number)
+    pub is_video: bool,
+    /// UI language for overlay labels.
+    pub language: Language,
+}
+
+impl OverlayState {
+    /// Create a new overlay state with default values.
+    pub fn new(max_shapes: u32, is_video: bool) -> Self {
+        Self {
+            frame_number: 0,
+            placed_shapes: 0,
+            max_shapes,
+            fps: 0.0,
+            notifications: Vec::new(),
+            is_video,
+            language: Language::English,
+        }
+    }
+
+    /// Create a new overlay state with an explicit UI language.
+    pub fn with_language(max_shapes: u32, is_video: bool, language: Language) -> Self {
+        Self {
+            language,
+            ..Self::new(max_shapes, is_video)
+        }
+    }
+
+    /// Render the overlay panel using egui.
+    /// Displays statistics in the top-left corner and notifications below.
+    pub fn render(&mut self, ctx: &egui::Context) {
+        self.cleanup_notifications();
+
+        egui::Area::new(egui::Id::new("overlay_stats"))
+            .fixed_pos(egui::pos2(10.0, 10.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_black_alpha(180))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .rounding(4.0)
+                    .show(ui, |ui| {
+                        let lang = self.language;
+                        // Show frame number only in video mode
+                        if self.is_video {
+                            ui.colored_label(
+                                egui::Color32::WHITE,
+                                format!("{}: {}", lang.t("Frame", "Кадр"), self.frame_number),
+                            );
+                        }
+
+                        ui.colored_label(
+                            egui::Color32::WHITE,
+                            format!(
+                                "{}: {} / {}",
+                                lang.t("Shapes", "Фигуры"),
+                                self.placed_shapes,
+                                self.max_shapes
+                            ),
+                        );
+
+                        ui.colored_label(egui::Color32::WHITE, format!("{}: {:.0}",lang.t("Preview FPS", "FPS превью"), self.fps));
+
+                        ui.colored_label(
+                            egui::Color32::from_gray(170),
+                            lang.t(
+                                "Space: pause   S: snapshot   H: panel   Esc: settings",
+                                "Пробел: пауза   S: снимок   H: панель   Esc: настройки",
+                            ),
+                        );
+
+                        // Render notifications below stats
+                        if !self.notifications.is_empty() {
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+
+                            for notification in &self.notifications {
+                                let color = if notification.is_error {
+                                    egui::Color32::from_rgb(255, 80, 80) // Red for errors
+                                } else {
+                                    egui::Color32::from_rgb(255, 220, 50) // Yellow for warnings
+                                };
+                                ui.colored_label(color, &notification.message);
+                            }
+                        }
+                    });
+            });
+    }
+
+    /// Add a notification that will be displayed for the given duration.
+    /// Maximum 5 notifications are visible at once; oldest are removed first.
+    pub fn add_notification(&mut self, message: String, duration_secs: f32, is_error: bool) {
+        let expires_at = Instant::now() + Duration::from_secs_f32(duration_secs);
+        self.notifications.push(Notification {
+            message,
+            expires_at,
+            is_error,
+        });
+
+        // Keep at most 5 visible notifications, removing oldest first
+        while self.notifications.len() > 5 {
+            self.notifications.remove(0);
+        }
+    }
+
+    /// Remove expired notifications.
+    pub fn cleanup_notifications(&mut self) {
+        let now = Instant::now();
+        self.notifications.retain(|n| n.expires_at > now);
+    }
+}

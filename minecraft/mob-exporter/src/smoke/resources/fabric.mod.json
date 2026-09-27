@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"teekasfigure_smoke","version":"1","environment":"client","entrypoints":{"client":["dev.teekasfigure.smoke.SmokeMod"]},"depends":{"fabricloader":">=0.16.0","minecraft":"~1.21.1"}}
